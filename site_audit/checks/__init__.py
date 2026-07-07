@@ -1,6 +1,5 @@
-# site_audit/checks/__init__.py
 """
-Пакет проверок (без security).
+Пакет проверок.
 """
 
 from . import (
@@ -8,7 +7,6 @@ from . import (
     seo,
     broken_links,
     images,
-    redirects,
     duplicates,
     placeholders,
 )
@@ -18,7 +16,6 @@ ALL_CHECKS = {
     seo.CHECK_NAME: seo,
     broken_links.CHECK_NAME: broken_links,
     images.CHECK_NAME: images,
-    redirects.CHECK_NAME: redirects,
     duplicates.CHECK_NAME: duplicates,
     placeholders.CHECK_NAME: placeholders,
 }
@@ -28,7 +25,6 @@ __all__ = [
     "seo",
     "broken_links",
     "images",
-    "redirects",
     "duplicates",
     "placeholders",
     "ALL_CHECKS",

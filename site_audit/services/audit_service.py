@@ -25,15 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
-
-import requests as req_lib
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from site_audit.checks import (
     broken_links,
@@ -41,21 +36,18 @@ from site_audit.checks import (
     empty_pages,
     images,
     placeholders,
-    redirects,
     seo,
 )
 from site_audit.config.logger import get_logger, set_trace_id
 from site_audit.config.settings import Settings
-from site_audit.crawler import async_crawl, async_try_sitemap, extract_links
+from site_audit.crawler import async_crawl, async_try_sitemap
 from site_audit.report import save_all
 from site_audit.utils import (
     AsyncResponse,
-    HEADERS,
     async_fetch_many,
     create_aiohttp_session,
     get_domain,
     is_async_response_ok,
-    is_html_response,
 )
 
 logger = get_logger("service.audit")
@@ -79,10 +71,6 @@ ALL_CHECKS: dict[str, dict[str, Any]] = {
     "images": {
         "module": images,
         "description": images.DESCRIPTION,
-    },
-    "redirects": {
-        "module": redirects,
-        "description": redirects.DESCRIPTION,
     },
     "duplicates": {
         "module": duplicates,
@@ -127,38 +115,6 @@ class AuditResult:
     excel_path: str
     html_path: str
     elapsed_seconds: float
-
-
-def _create_session(workers: int) -> req_lib.Session:
-    """
-    Создаёт requests.Session с пулом соединений и retry-политикой.
-
-    Используется для синхронных проверок (broken_links, images, redirects),
-    пока они не переведены на async.
-
-    Args:
-        workers: количество параллельных потоков (определяет размер пула).
-
-    Returns:
-        Настроенный объект Session.
-    """
-    session = req_lib.Session()
-    session.headers.update(HEADERS)
-
-    pool_size = min(workers + 5, 50)
-    adapter = HTTPAdapter(
-        pool_connections=pool_size,
-        pool_maxsize=pool_size,
-        max_retries=Retry(
-            total=2,
-            backoff_factor=1.0,
-            status_forcelist=[500, 502, 503, 504],
-        ),
-    )
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-
-    return session
 
 
 class AuditService:
@@ -269,7 +225,7 @@ class AuditService:
         Этапы:
           1. Сбор URL (sitemap / BFS-обход) — async
           2. Загрузка страниц (aiohttp + семафор) — async
-          3. Проверки — CPU-bound в executor, IO-bound синхронно (пока)
+          3. Проверки — CPU-bound в executor
           4. Генерация отчётов — в executor (IO-bound файловые операции)
 
         Args:
@@ -504,9 +460,8 @@ class AuditService:
         запускаются в ThreadPoolExecutor через run_in_executor,
         чтобы не блокировать event loop.
 
-        IO-bound проверки (broken_links, images, redirects) пока остаются
-        синхронными и тоже выполняются в executor. Они будут переведены
-        на async в последующих шагах.
+        IO-bound проверки (broken_links, images) выполняются
+        в executor с внутренним async event loop.
 
         Args:
             base_url: корневой URL сайта.
@@ -544,7 +499,6 @@ class AuditService:
 
             t0 = time.time()
             try:
-                # Выполняем проверку в executor, чтобы не блокировать event loop
                 res = await loop.run_in_executor(
                     None,
                     partial(
@@ -602,7 +556,6 @@ class AuditService:
         Returns:
             Список найденных проблем.
         """
-        # Конвертируем AsyncResponse в формат, совместимый с проверками
         compatible_pages = _make_compatible_pages(pages)
 
         if name == "empty_pages":
@@ -629,20 +582,6 @@ class AuditService:
                 max_size_kb=params.max_image_size_kb,
                 workers=check_workers,
             )
-
-        if name == "redirects":
-            res = mod.check(
-                urls,
-                site_domain=domain,
-                workers=check_workers,
-            )
-            extra = mod.check_internal_links_to_redirects(
-                compatible_pages,
-                workers=check_workers,
-                verbose=False,
-            )
-            res.extend(extra)
-            return res
 
         if name == "duplicates":
             return mod.check(compatible_pages, verbose=False)
@@ -748,10 +687,8 @@ def _make_compatible_pages(
 
         if isinstance(resp, AsyncResponse):
             if resp.error and resp.status == 0:
-                # Сетевая ошибка — проверки ожидают Exception
                 new_page["resp"] = ConnectionError(resp.error)
             else:
-                # AsyncResponse совместим по интерфейсу с проверками
                 new_page["resp"] = resp
         else:
             new_page["resp"] = resp
