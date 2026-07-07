@@ -1,7 +1,11 @@
 # 🔍 Site Audit — комплексный аудит сайта
 
-Инструмент командной строки для автоматического поиска технических проблем на сайте.
+Инструмент для автоматического поиска технических проблем на сайте.
 Скачивает страницы, анализирует HTML и формирует отчёт в Excel и HTML.
+
+Два способа использования:
+- **CLI** — запуск из командной строки
+- **Telegram-бот** — запуск аудита через бота с inline-кнопками
 
 ---
 
@@ -29,19 +33,48 @@
 ### Зависимости
 
 ```bash
-pip install requests beautifulsoup4 lxml openpyxl
+pip install requests beautifulsoup4 lxml openpyxl python-dotenv "python-telegram-bot[job-queue]"
 ```
 
-### Структура проекта
+### Конфигурация
+
+Скопируйте файл `.env.example` в `.env` и заполните значения:
+
+```bash
+cp .env.example .env
+```
+
+Обязательная переменная — `TELEGRAM_BOT_TOKEN` (нужна только для запуска бота). Все остальные параметры имеют значения по умолчанию.
+
+---
+
+## Структура проекта
 
 ```
 какая-то_папка/              ← запускать отсюда
+├── .env                     # Переменные окружения (не коммитить!)
+├── .env.example             # Шаблон переменных окружения
+├── pyproject.toml           # Конфигурация проекта и инструментов
 └── site_audit/
     ├── __init__.py
     ├── __main__.py          # CLI-оркестратор
     ├── utils.py             # HTTP-клиент, хелперы
     ├── crawler.py           # Sitemap + обход по ссылкам
     ├── report.py            # Генерация Excel и HTML
+    ├── config/
+    │   ├── __init__.py
+    │   ├── settings.py      # Загрузка .env, валидация настроек
+    │   └── logger.py        # JSON-логгер с ротацией
+    ├── services/
+    │   ├── __init__.py
+    │   └── audit_service.py # Сервис аудита (единая точка входа)
+    ├── bot/
+    │   ├── __init__.py
+    │   ├── __main__.py      # Точка входа: python -m site_audit.bot
+    │   ├── app.py           # Сборка и запуск бота
+    │   ├── handlers.py      # Обработчики команд и кнопок
+    │   ├── keyboards.py     # Inline-клавиатуры
+    │   └── states.py        # Состояние сессий пользователей
     └── checks/
         ├── __init__.py
         ├── empty_pages.py   # Пустые страницы
@@ -57,7 +90,7 @@ pip install requests beautifulsoup4 lxml openpyxl
 
 ---
 
-## Использование
+## Использование: CLI
 
 ### Базовый запуск (все проверки)
 
@@ -101,6 +134,50 @@ python -m site_audit https://example.com --output-dir ./reports
 python -m site_audit --list-checks
 ```
 
+Приоритет параметров: аргумент CLI перекрывает значение из `.env`, значение из `.env` перекрывает значение по умолчанию.
+
+---
+
+## Использование: Telegram-бот
+
+### Запуск бота
+
+```bash
+python -m site_audit.bot
+```
+
+### Как работает бот
+
+1. Отправьте `/start` — бот покажет приветствие и кнопку «Начать аудит»
+2. Нажмите «Начать аудит» — бот попросит ввести URL сайта
+3. Отправьте URL (например, `https://example.com`) — появится главное меню:
+   - **Проверки** — включение/выключение отдельных проверок (toggle-кнопки)
+   - **Настройки** — изменение параметров (лимит страниц, потоки, таймаут и др.)
+   - **Запустить аудит** — запуск проверки
+   - **Отмена** — сброс сессии
+4. После запуска бот отправляет прогресс выполнения
+5. По завершении бот отправит:
+   - Текстовую сводку с результатами по каждой проверке
+   - Excel-файл отчёта
+   - HTML-файл отчёта
+
+### Команды бота
+
+| Команда | Описание |
+|---|---|
+| `/start` | Начать работу / сбросить сессию |
+| `/help` | Справка по использованию |
+
+### Ограничение доступа
+
+Чтобы разрешить доступ к боту только определённым пользователям, укажите их Telegram ID в `.env`:
+
+```bash
+ALLOWED_USER_IDS=123456789,987654321
+```
+
+Если переменная пуста — доступ есть у всех.
+
 ---
 
 ## Параметры командной строки
@@ -119,10 +196,35 @@ python -m site_audit --list-checks
 | `--min-text-length` | 100 | Порог пустой страницы (символов видимого текста) |
 | `--max-image-size-kb` | 500 | Порог тяжёлой картинки (КБ) |
 | `--check-external-links` | false | Проверять внешние ссылки |
-| `--output-dir` | . | Директория для отчётов |
-| `--excel-name` | audit_report.xlsx | Имя Excel-файла |
-| `--html-name` | audit_report.html | Имя HTML-файла |
+| `--output-dir` | `./reports` | Директория для отчётов |
+| `--excel-name` | `audit_report.xlsx` | Имя Excel-файла |
+| `--html-name` | `audit_report.html` | Имя HTML-файла |
 | `--quiet` | false | Минимальный вывод в консоль |
+
+---
+
+## Переменные окружения (.env)
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | (обязательная) | Токен бота от @BotFather |
+| `ALLOWED_USER_IDS` | пусто (все) | Telegram ID через запятую |
+| `DEFAULT_MAX_CRAWL_PAGES` | 500 | Лимит страниц при BFS-обходе |
+| `DEFAULT_MAX_DEPTH` | 3 | Глубина обхода |
+| `DEFAULT_LIMIT` | 0 (без лимита) | Лимит URL для проверки |
+| `DEFAULT_WORKERS` | 10 | Потоки загрузки |
+| `DEFAULT_DELAY` | 0.0 | Задержка между запросами (сек) |
+| `DEFAULT_TIMEOUT` | 15 | Таймаут запросов (сек) |
+| `DEFAULT_MIN_TEXT_LENGTH` | 100 | Порог пустой страницы (символов) |
+| `DEFAULT_MAX_IMAGE_SIZE_KB` | 500 | Порог тяжёлой картинки (КБ) |
+| `DEFAULT_CHECK_EXTERNAL_LINKS` | false | Проверять внешние ссылки |
+| `OUTPUT_DIR` | `./reports` | Директория для отчётов |
+| `EXCEL_REPORT_NAME` | `audit_report.xlsx` | Имя Excel-файла |
+| `HTML_REPORT_NAME` | `audit_report.html` | Имя HTML-файла |
+| `LOG_LEVEL` | `INFO` | Уровень логирования |
+| `LOG_FILE_PATH` | `./logs/app.log` | Путь к файлу логов |
+| `LOG_MAX_BYTES` | 10485760 | Макс. размер лога (байт) |
+| `LOG_BACKUP_COUNT` | 5 | Кол-во файлов ротации |
 
 ---
 
@@ -134,14 +236,26 @@ python -m site_audit --list-checks
 
 - Лист «Сводка» — общая статистика: сайт, дата, количество проблем по каждой проверке
 - Отдельный лист для каждой проверки — таблица с проблемами, автоширина колонок, фильтры в шапке, закреплённая первая строка
-
-Удобно открывать в Excel или Google Sheets для фильтрации и сортировки.
+- Удобно открывать в Excel или Google Sheets для фильтрации и сортировки.
 
 ### HTML (`audit_report.html`)
 
 - Единый файл с навигацией по проверкам
 - Таблицы с кликабельными ссылками
 - Подходит для отправки клиенту или просмотра в браузере
+
+---
+
+## Логирование
+
+Логи выводятся в двух форматах одновременно:
+
+- **Консоль (stdout)** — читаемый формат с цветовой подсветкой уровней
+- **Файл (`logs/app.log`)** — JSON-формат для парсинга и мониторинга
+
+Каждая запись в файле содержит поля: `timestamp`, `level`, `logger`, `message`, `trace_id`, `context`.
+
+Папка `logs/` создаётся автоматически при запуске. Ротация файлов настраивается через `LOG_MAX_BYTES` и `LOG_BACKUP_COUNT`.
 
 ---
 
@@ -169,13 +283,13 @@ python -m site_audit --list-checks
 
 ## Примеры
 
-### Быстрый аудит небольшого сайта
+### CLI: быстрый аудит небольшого сайта
 
 ```bash
 python -m site_audit https://mysite.ru --limit 30
 ```
 
-### Полный аудит с внешними ссылками и сохранением в папку
+### CLI: полный аудит с внешними ссылками
 
 ```bash
 python -m site_audit https://mysite.ru \
@@ -184,7 +298,7 @@ python -m site_audit https://mysite.ru \
     --output-dir ./audit_results
 ```
 
-### Только SEO и дубликаты на первых 100 страницах
+### CLI: только SEO и дубликаты на первых 100 страницах
 
 ```bash
 python -m site_audit https://mysite.ru \
@@ -192,7 +306,7 @@ python -m site_audit https://mysite.ru \
     --limit 100
 ```
 
-### Аудит с задержкой (для сайтов с защитой от ботов)
+### CLI: аудит с задержкой (для сайтов с защитой от ботов)
 
 ```bash
 python -m site_audit https://mysite.ru \
@@ -201,11 +315,39 @@ python -m site_audit https://mysite.ru \
     --timeout 30
 ```
 
+### Telegram-бот: запуск
+
+```bash
+python -m site_audit.bot
+```
+
 ---
 
 ## Использование как библиотеки
 
 ```python
+from site_audit.config import get_settings, setup_logging
+from site_audit.services import AuditService
+from site_audit.services.audit_service import AuditParams
+
+# Инициализация
+settings = get_settings()
+setup_logging(log_level=settings.log_level, log_file_path=settings.log_file_path)
+
+# Создание сервиса
+service = AuditService(settings)
+
+# Запуск аудита с параметрами из .env
+params = service.create_params_from_settings("https://example.com")
+result = service.run_audit(params)
+
+print(f"Проблем найдено: {result.total_issues}")
+print(f"Excel: {result.excel_path}")
+print(f"HTML: {result.html_path}")
+```
+
+```python
+# Низкоуровневое использование (без сервиса)
 from site_audit.crawler import try_sitemap, crawl
 from site_audit.checks import seo, empty_pages, broken_links
 from site_audit.utils import fetch, parse_html, visible_text
@@ -229,19 +371,36 @@ for r in seo.filter_with_issues(seo_results):
 ## FAQ
 
 **Q: Sitemap не найден, обход собирает мало страниц**
-A: Увеличьте глубину и лимит: `--max-depth 5 --max-crawl-pages 1000`
+
+A: Увеличьте глубину и лимит: `--max-depth 5 --max-crawl-pages 1000` (CLI) или измените в `.env` / настройках бота.
 
 **Q: Сайт блокирует запросы / много ошибок 403/429**
-A: Уменьшите параллельность и добавьте задержку: `--workers 2 --delay 2.0`
+
+A: Уменьшите параллельность и добавьте задержку: `--workers 2 --delay 2.0` (CLI) или настройте через кнопки бота.
 
 **Q: Аудит занимает слишком много времени**
-A: Ограничьте число страниц (`--limit 100`) или выберите конкретные проверки (`--checks seo,empty_pages`)
+
+A: Ограничьте число страниц (`--limit 100`) или выберите конкретные проверки (`--checks seo,empty_pages`).
 
 **Q: Как проверить только SEO без битых ссылок?**
-A: `--checks seo`
+
+A: CLI: `--checks seo`. Бот: отключите остальные проверки в меню «Проверки».
 
 **Q: Excel-файл не открывается**
-A: Убедитесь, что установлен openpyxl: `pip install openpyxl`
+
+A: Убедитесь, что установлен `openpyxl`: `pip install openpyxl`.
+
+**Q: Бот не реагирует на /start**
+
+A: Проверьте, что `TELEGRAM_BOT_TOKEN` указан в `.env`. Проверьте логи в `./logs/app.log`. Убедитесь, что библиотека установлена: `pip install "python-telegram-bot[job-queue]"`.
+
+**Q: Как ограничить доступ к боту?**
+
+A: Укажите Telegram ID пользователей в `.env`: `ALLOWED_USER_IDS=123456789,987654321`.
+
+**Q: Где хранятся логи?**
+
+A: По умолчанию в `./logs/app.log`. Путь настраивается через `LOG_FILE_PATH` в `.env`.
 
 ---
 

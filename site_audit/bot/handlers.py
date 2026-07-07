@@ -18,7 +18,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from telegram import Update
+from telegram import InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -57,6 +58,53 @@ from .keyboards import (
 from .states import SETTINGS_BY_KEY, SessionManager, UserSession, UserState
 
 logger = get_logger("bot.handlers")
+
+
+# ── Безопасные обёртки для редактирования сообщений ───────────
+
+async def _safe_edit_text(
+    query: Any,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """
+    Редактирует текст сообщения, игнорируя ошибку «message is not modified».
+
+    Args:
+        query: callback-запрос.
+        text: новый текст сообщения.
+        parse_mode: режим форматирования (Markdown, HTML).
+        reply_markup: inline-клавиатура.
+    """
+    try:
+        await query.edit_message_text(
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def _safe_edit_markup(
+    query: Any,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    """
+    Редактирует клавиатуру сообщения, игнорируя ошибку «message is not modified».
+
+    Args:
+        query: callback-запрос.
+        reply_markup: новая inline-клавиатура.
+    """
+    try:
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 # ── Проверка доступа ──────────────────────────────────────────
@@ -185,7 +233,6 @@ async def _handle_url_input(
 
     url = text.strip()
 
-    # Базовая валидация URL
     if not url:
         await update.message.reply_text("❌ URL не может быть пустым. Попробуйте ещё раз:")
         return
@@ -194,11 +241,9 @@ async def _handle_url_input(
         await update.message.reply_text("❌ URL не должен содержать пробелов. Попробуйте ещё раз:")
         return
 
-    # Добавляем протокол, если не указан
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # Проверяем наличие домена
     if "." not in url.split("//", 1)[-1]:
         await update.message.reply_text(
             "❌ Некорректный URL. Укажите домен, например: `example.com`",
@@ -282,7 +327,7 @@ async def handle_callback(
     session_manager: SessionManager = context.bot_data["session_manager"]
 
     if not _is_authorized(user_id, settings):
-        await query.edit_message_text("⛔ У вас нет доступа к этому боту.")
+        await _safe_edit_text(query, "⛔ У вас нет доступа к этому боту.")
         return
 
     session = session_manager.get(user_id)
@@ -298,14 +343,17 @@ async def handle_callback(
         return
 
     # ── Маршрутизация по callback-данным ──────────────────────
+    # ВАЖНО: точные совпадения проверяются ДО startswith,
+    # чтобы "check:back" не попало в обработку toggle проверки.
+
     if data == CB_NEW_AUDIT:
         await _cb_new_audit(query, session)
 
     elif data == CB_SELECT_CHECKS:
         await _cb_select_checks(query, session)
 
-    elif data.startswith(f"{PREFIX_CHECK}:"):
-        await _cb_check_toggle(query, session, data)
+    elif data == CB_CHECKS_BACK:
+        await _cb_back_to_menu(query, session)
 
     elif data == CB_CHECKS_ALL_ON:
         await _cb_checks_all(query, session, enabled=True)
@@ -313,20 +361,20 @@ async def handle_callback(
     elif data == CB_CHECKS_ALL_OFF:
         await _cb_checks_all(query, session, enabled=False)
 
-    elif data == CB_CHECKS_BACK:
-        await _cb_back_to_menu(query, session)
+    elif data.startswith(f"{PREFIX_CHECK}:"):
+        await _cb_check_toggle(query, session, data)
 
     elif data == CB_SETTINGS:
         await _cb_settings(query, session)
-
-    elif data.startswith(f"{PREFIX_SETTING}:"):
-        await _cb_setting_select(query, session, data)
 
     elif data == CB_SETTINGS_BACK:
         await _cb_back_to_menu(query, session)
 
     elif data == CB_SETTINGS_EXTERNAL:
         await _cb_toggle_external(query, session)
+
+    elif data.startswith(f"{PREFIX_SETTING}:"):
+        await _cb_setting_select(query, session, data)
 
     elif data == CB_RUN_AUDIT:
         await _cb_run_audit(query, session, context)
@@ -348,7 +396,8 @@ async def _cb_new_audit(query: Any, session: UserSession) -> None:
     session.reset()
     session.state = UserState.WAITING_URL
 
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         "🌐 Отправьте URL сайта для аудита.\n\n"
         "Пример: `https://example.com`",
         parse_mode="Markdown",
@@ -359,7 +408,8 @@ async def _cb_select_checks(query: Any, session: UserSession) -> None:
     """Переход к экрану выбора проверок."""
     session.state = UserState.SELECTING_CHECKS
 
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         "📋 *Выберите проверки:*\n\n"
         "Нажимайте на проверку, чтобы включить или выключить её.",
         parse_mode="Markdown",
@@ -372,9 +422,7 @@ async def _cb_check_toggle(query: Any, session: UserSession, data: str) -> None:
     check_name = data.split(":", 1)[1]
     session.toggle_check(check_name)
 
-    await query.edit_message_reply_markup(
-        reply_markup=build_checks_keyboard(session),
-    )
+    await _safe_edit_markup(query, reply_markup=build_checks_keyboard(session))
 
 
 async def _cb_checks_all(query: Any, session: UserSession, *, enabled: bool) -> None:
@@ -382,9 +430,7 @@ async def _cb_checks_all(query: Any, session: UserSession, *, enabled: bool) -> 
     for name in session.selected_checks:
         session.selected_checks[name] = enabled
 
-    await query.edit_message_reply_markup(
-        reply_markup=build_checks_keyboard(session),
-    )
+    await _safe_edit_markup(query, reply_markup=build_checks_keyboard(session))
 
 
 async def _cb_back_to_menu(query: Any, session: UserSession) -> None:
@@ -393,7 +439,8 @@ async def _cb_back_to_menu(query: Any, session: UserSession) -> None:
     session.pending_setting_key = ""
 
     summary = format_session_summary(session)
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         f"{summary}\n"
         f"Выберите действие:",
         parse_mode="Markdown",
@@ -405,7 +452,8 @@ async def _cb_settings(query: Any, session: UserSession) -> None:
     """Переход к экрану настроек."""
     session.state = UserState.SETTINGS
 
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         "⚙️ *Настройки аудита:*\n\n"
         "Нажмите на параметр, чтобы изменить его значение.",
         parse_mode="Markdown",
@@ -435,7 +483,8 @@ async def _cb_setting_select(query: Any, session: UserSession, data: str) -> Non
     elif meta.min_value is not None:
         bounds = f"от {meta.min_value}"
 
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         f"⚙️ *{meta.label}*\n\n"
         f"{meta.description}\n"
         f"Текущее значение: `{current_value}`\n"
@@ -458,9 +507,7 @@ async def _cb_toggle_external(query: Any, session: UserSession) -> None:
         }},
     )
 
-    await query.edit_message_reply_markup(
-        reply_markup=build_settings_keyboard(session),
-    )
+    await _safe_edit_markup(query, reply_markup=build_settings_keyboard(session))
 
 
 async def _cb_run_audit(
@@ -469,9 +516,9 @@ async def _cb_run_audit(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Запуск аудита в фоновом потоке."""
-    # Валидация
     if not session.url:
-        await query.edit_message_text(
+        await _safe_edit_text(
+            query,
             "❌ URL не задан. Начните заново.",
             reply_markup=build_start_keyboard(),
         )
@@ -484,7 +531,8 @@ async def _cb_run_audit(
 
     session.state = UserState.AUDIT_RUNNING
 
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         f"⏳ *Аудит запущен*\n\n"
         f"🌐 URL: `{session.url}`\n"
         f"📋 Проверок: {len(enabled_checks)}\n\n"
@@ -502,7 +550,6 @@ async def _cb_run_audit(
         }},
     )
 
-    # Запуск в фоновом потоке, чтобы не блокировать event loop бота
     audit_service: AuditService = context.bot_data["audit_service"]
     settings: Settings = context.bot_data["settings"]
     chat_id = query.message.chat_id
@@ -549,14 +596,12 @@ def _run_audit_thread(
     def on_progress(message: str) -> None:
         """Callback прогресса — накапливает сообщения."""
         progress_messages.append(message)
-        # Отправляем каждое 3-е сообщение, чтобы не спамить
         if len(progress_messages) % 3 == 0:
             _schedule_message(application, chat_id, message)
 
     try:
         result = audit_service.run_audit(params, on_progress=on_progress)
 
-        # Формируем итоговое сообщение
         summary_lines = [
             "✅ *Аудит завершён!*\n",
             f"🌐 Сайт: `{result.base_url}`",
@@ -574,7 +619,6 @@ def _run_audit_thread(
 
         summary_text = "\n".join(summary_lines)
 
-        # Отправляем итог и файлы
         _schedule_message(application, chat_id, summary_text, parse_mode="Markdown")
         _schedule_file(application, chat_id, result.excel_path, "📊 Excel-отчёт")
         _schedule_file(application, chat_id, result.html_path, "📄 HTML-отчёт")
@@ -689,19 +733,13 @@ def register_handlers(
         audit_service: сервис аудита.
         settings: настройки приложения.
     """
-    # Сохраняем зависимости в bot_data для доступа из обработчиков
     application.bot_data["session_manager"] = session_manager
     application.bot_data["audit_service"] = audit_service
     application.bot_data["settings"] = settings
 
-    # Команды
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
-
-    # Callback-кнопки
     application.add_handler(CallbackQueryHandler(handle_callback))
-
-    # Текстовые сообщения (URL, значения настроек)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Обработчики бота зарегистрированы")
@@ -715,7 +753,8 @@ async def _cb_cancel(
     """Отмена и сброс сессии."""
     session_manager.reset(session.user_id)
 
-    await query.edit_message_text(
+    await _safe_edit_text(
+        query,
         "👋 Сессия завершена.\n\n"
         "Нажмите /start, чтобы начать новый аудит.",
     )
