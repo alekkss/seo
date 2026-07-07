@@ -589,15 +589,17 @@ def _run_audit_thread(
     """
     Выполняет аудит в фоновом потоке.
 
-    Отправляет сообщения о прогрессе и результатах в чат через job_queue.
+    Отправляет все сообщения о прогрессе в чат.
+    Сообщения о загрузке страниц (⬇️ Загружено X/Y) отправляются
+    каждое 3-е, чтобы не спамить. Все остальные — отправляются всегда.
     """
-    progress_messages: list[str] = []
-
     def on_progress(message: str) -> None:
-        """Callback прогресса — накапливает сообщения."""
-        progress_messages.append(message)
-        if len(progress_messages) % 3 == 0:
-            _schedule_message(application, chat_id, message)
+        """Callback прогресса — отправляет сообщение в Telegram."""
+        # Сообщения о промежуточном прогрессе загрузки фильтруем,
+        # чтобы не спамить (они приходят каждые 50 страниц)
+        if message.startswith("⬇️ Загружено "):
+            return
+        _schedule_message(application, chat_id, message)
 
     try:
         result = audit_service.run_audit(params, on_progress=on_progress)
