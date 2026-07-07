@@ -1,0 +1,115 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "site-audit"
+version = "1.1.0"
+description = "Комплексный аудит сайта: CLI + Telegram-бот"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "site_audit"},
+]
+
+dependencies = [
+    # Аудит
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "openpyxl>=3.1.0",
+
+    # Конфигурация
+    "python-dotenv>=1.0.0",
+
+    # Telegram-бот
+    "python-telegram-bot>=21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "pre-commit>=3.7.0",
+    "pytest>=8.0.0",
+    "types-requests>=2.31.0",
+    "types-beautifulsoup4>=4.12.0",
+    "types-openpyxl>=3.1.0",
+]
+
+[project.scripts]
+site-audit = "site_audit.__main__:main"
+
+# ═══════════════════════════════════════════════════════════════
+# Ruff — линтинг и форматирование (замена black + flake8 + isort)
+# ═══════════════════════════════════════════════════════════════
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["site_audit", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "SIM",    # flake8-simplify
+    "RET",    # flake8-return
+    "PTH",    # flake8-use-pathlib
+    "RUF",    # ruff-специфичные правила
+]
+ignore = [
+    "E501",   # длина строки — контролируется через line-length
+    "RET504", # ненужное присваивание перед return
+    "SIM108", # тернарный оператор вместо if/else
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["site_audit"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+# ═══════════════════════════════════════════════════════════════
+# Mypy — статическая проверка типов
+# ═══════════════════════════════════════════════════════════════
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+warn_unreachable = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+show_column_numbers = true
+
+[[tool.mypy.overrides]]
+module = [
+    "bs4.*",
+    "lxml.*",
+    "openpyxl.*",
+]
+ignore_missing_imports = true
+
+# ═══════════════════════════════════════════════════════════════
+# Pytest
+# ═══════════════════════════════════════════════════════════════
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
