@@ -1,4 +1,3 @@
-# site_audit/__main__.py
 """
 CLI-оркестратор аудита сайта.
 
@@ -12,53 +11,21 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .utils import fetch, get_domain, is_html_response
-from .crawler import try_sitemap, crawl
-from .checks import empty_pages, seo, broken_links, images, redirects, duplicates, placeholders
-from .report import save_all
-
-ALL_CHECKS: dict[str, dict] = {
-    "empty_pages": {
-        "module": empty_pages,
-        "description": empty_pages.DESCRIPTION,
-    },
-    "seo": {
-        "module": seo,
-        "description": seo.DESCRIPTION,
-    },
-    "broken_links": {
-        "module": broken_links,
-        "description": broken_links.DESCRIPTION,
-    },
-    "images": {
-        "module": images,
-        "description": images.DESCRIPTION,
-    },
-    "redirects": {
-        "module": redirects,
-        "description": redirects.DESCRIPTION,
-    },
-    "duplicates": {
-        "module": duplicates,
-        "description": duplicates.DESCRIPTION,
-    },
-    "placeholders": {
-        "module": placeholders,
-        "description": placeholders.DESCRIPTION,
-    },
-}
+from .config.logger import setup_logging
+from .config.settings import Settings, get_settings
+from .services.audit_service import ALL_CHECKS, AuditParams, AuditService
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Парсит аргументы командной строки."""
     p = argparse.ArgumentParser(
         prog="site_audit",
         description="Комплексный аудит сайта: пустые страницы, SEO, битые ссылки, "
                     "картинки, редиректы, дубли, заглушки.",
     )
-    p.add_argument("base_url", help="URL сайта, например https://example.com")
+    p.add_argument("base_url", nargs="?", default=None,
+                   help="URL сайта, например https://example.com")
 
     all_names = ",".join(ALL_CHECKS.keys())
     p.add_argument("--checks", default=all_names,
@@ -66,224 +33,144 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--list-checks", action="store_true",
                    help="Показать доступные проверки и выйти")
 
-    p.add_argument("--max-crawl-pages", type=int, default=500)
-    p.add_argument("--max-depth", type=int, default=3)
+    p.add_argument("--max-crawl-pages", type=int, default=None)
+    p.add_argument("--max-depth", type=int, default=None)
     p.add_argument("--limit", type=int, default=None)
 
-    p.add_argument("--workers", type=int, default=10)
-    p.add_argument("--delay", type=float, default=0.0)
-    p.add_argument("--timeout", type=int, default=15)
+    p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--delay", type=float, default=None)
+    p.add_argument("--timeout", type=int, default=None)
 
-    p.add_argument("--min-text-length", type=int, default=100)
-    p.add_argument("--max-image-size-kb", type=int, default=500)
-    p.add_argument("--check-external-links", action="store_true", default=False)
+    p.add_argument("--min-text-length", type=int, default=None)
+    p.add_argument("--max-image-size-kb", type=int, default=None)
+    p.add_argument("--check-external-links", action="store_true", default=None)
 
-    p.add_argument("--output-dir", default=".")
-    p.add_argument("--excel-name", default="audit_report.xlsx")
-    p.add_argument("--html-name", default="audit_report.html")
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--excel-name", default=None)
+    p.add_argument("--html-name", default=None)
     p.add_argument("--quiet", action="store_true")
 
     return p.parse_args(argv)
 
 
-def download_pages(urls: list[str], *,
-                   workers: int = 10,
-                   delay: float = 0.0,
-                   timeout: int = 15,
-                   verbose: bool = True) -> list[dict]:
-    pages: list[dict] = []
-    done = 0
-    total = len(urls)
+def _build_params(args: argparse.Namespace, settings: Settings) -> AuditParams:
+    """
+    Создаёт AuditParams, объединяя CLI-аргументы и настройки из .env.
 
-    def _download(url: str) -> dict:
-        resp = fetch(url, timeout=timeout)
-        html = None
-        if isinstance(resp, Exception):
-            pass
-        elif is_html_response(resp) and resp.status_code == 200:
-            html = resp.text
-        if delay:
-            time.sleep(delay)
-        return {"url": url, "resp": resp, "html": html}
+    Приоритет: CLI-аргумент > переменная окружения > значение по умолчанию.
+    """
+    check_names = [c.strip() for c in args.checks.split(",") if c.strip()]
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_download, url): url for url in urls}
-        for future in as_completed(futures):
-            page = future.result()
-            pages.append(page)
-            done += 1
-            if verbose and done % 25 == 0:
-                print(f"  Загружено {done}/{total}")
-
-    if verbose:
-        ok = sum(1 for p in pages if p["html"] is not None)
-        print(f"  Загрузка завершена: {ok}/{total} страниц с HTML.")
-
-    return pages
-
-
-def run_checks(check_names: list[str],
-               base_url: str,
-               urls: list[str],
-               pages: list[dict],
-               args: argparse.Namespace,
-               verbose: bool = True) -> tuple[dict[str, list[dict]], dict[str, str]]:
-    results: dict[str, list[dict]] = {}
-    summaries: dict[str, str] = {}
-    domain = get_domain(base_url)
-
-    for name in check_names:
-        entry = ALL_CHECKS[name]
-        mod = entry["module"]
-
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"  Проверка: {entry['description']}")
-            print(f"{'='*60}")
-
-        t0 = time.time()
-
-        try:
-            if name == "empty_pages":
-                res = mod.check_many(pages, min_text_length=args.min_text_length)
-                res = mod.filter_empty(res)
-
-            elif name == "seo":
-                res = mod.check_many(pages)
-                res = mod.filter_with_issues(res)
-
-            elif name == "broken_links":
-                res = mod.check(
-                    pages,
-                    check_external=args.check_external_links,
-                    workers=args.workers,
-                )
-
-            elif name == "images":
-                res = mod.check(
-                    pages,
-                    max_size_kb=args.max_image_size_kb,
-                    workers=args.workers,
-                )
-
-            elif name == "redirects":
-                res = mod.check(
-                    urls,
-                    site_domain=domain,
-                    workers=args.workers,
-                )
-                extra = mod.check_internal_links_to_redirects(
-                    pages,
-                    workers=args.workers,
-                    verbose=verbose,
-                )
-                res.extend(extra)
-
-            elif name == "duplicates":
-                res = mod.check(pages, verbose=verbose)
-
-            elif name == "placeholders":
-                res = mod.check_many(pages, verbose=verbose)
-
-            else:
-                print(f"  [!] Неизвестная проверка: {name}, пропускаю.")
-                continue
-
-        except Exception as exc:
-            print(f"  [!] Ошибка в проверке {name}: {exc}")
-            res = []
-
-        elapsed = time.time() - t0
-        results[name] = res
-        summaries[name] = mod.summary(res)
-
-        if verbose:
-            print(mod.summary(res))
-            print(f"  (выполнено за {elapsed:.1f} сек)")
-
-    return results, summaries
+    return AuditParams(
+        base_url=args.base_url,
+        check_names=check_names,
+        max_crawl_pages=args.max_crawl_pages if args.max_crawl_pages is not None
+            else settings.default_max_crawl_pages,
+        max_depth=args.max_depth if args.max_depth is not None
+            else settings.default_max_depth,
+        limit=args.limit if args.limit is not None
+            else settings.default_limit,
+        workers=args.workers if args.workers is not None
+            else settings.default_workers,
+        delay=args.delay if args.delay is not None
+            else settings.default_delay,
+        timeout=args.timeout if args.timeout is not None
+            else settings.default_timeout,
+        min_text_length=args.min_text_length if args.min_text_length is not None
+            else settings.default_min_text_length,
+        max_image_size_kb=args.max_image_size_kb if args.max_image_size_kb is not None
+            else settings.default_max_image_size_kb,
+        check_external_links=args.check_external_links if args.check_external_links is not None
+            else settings.default_check_external_links,
+        output_dir=args.output_dir if args.output_dir is not None
+            else settings.output_dir,
+        excel_name=args.excel_name if args.excel_name is not None
+            else settings.excel_report_name,
+        html_name=args.html_name if args.html_name is not None
+            else settings.html_report_name,
+    )
 
 
-def main(argv: list[str] | None = None):
+def _print_progress(message: str) -> None:
+    """Callback для вывода прогресса в консоль."""
+    print(f"  {message}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Главная функция CLI."""
     args = parse_args(argv)
 
+    # ── Список проверок ───────────────────────────────────────
     if args.list_checks:
         print("Доступные проверки:")
         for name, entry in ALL_CHECKS.items():
             print(f"  {name:20s} — {entry['description']}")
         return
 
-    base_url = args.base_url.rstrip("/")
-    if not base_url.startswith("http"):
-        base_url = "https://" + base_url
-
-    verbose = not args.quiet
-    check_names = [c.strip() for c in args.checks.split(",") if c.strip()]
-
-    for name in check_names:
-        if name not in ALL_CHECKS:
-            print(f"Неизвестная проверка: {name}")
-            print(f"Доступные: {', '.join(ALL_CHECKS.keys())}")
-            sys.exit(1)
-
-    # ── 1. Сбор URL ────────────────────────────────────────────────────
-    print(f"\n[1/4] Сбор URL с {base_url} ...")
-    urls_set = try_sitemap(base_url, verbose=verbose)
-    if urls_set:
-        urls = list(urls_set)
-    else:
-        print("  Обхожу сайт по ссылкам...")
-        urls = crawl(base_url, max_pages=args.max_crawl_pages,
-                     max_depth=args.max_depth, verbose=verbose)
-
-    if args.limit:
-        urls = urls[:args.limit]
-
-    print(f"  Итого URL для проверки: {len(urls)}")
-
-    if not urls:
-        print("  Не найдено ни одного URL. Проверьте адрес сайта.")
+    # ── Проверка обязательного аргумента ──────────────────────
+    if not args.base_url:
+        print("Ошибка: укажите URL сайта для аудита.")
+        print("Использование: python -m site_audit https://example.com")
         sys.exit(1)
 
-    # ── 2. Загрузка страниц ────────────────────────────────────────────
-    print(f"\n[2/4] Загрузка {len(urls)} страниц ({args.workers} потоков)...")
-    pages = download_pages(
-        urls,
-        workers=args.workers,
-        delay=args.delay,
-        timeout=args.timeout,
-        verbose=verbose,
+    # ── Загрузка конфигурации ─────────────────────────────────
+    try:
+        settings = get_settings()
+    except ValueError as exc:
+        print(f"Ошибка конфигурации: {exc}")
+        sys.exit(1)
+
+    # ── Настройка логирования ─────────────────────────────────
+    setup_logging(
+        log_level=settings.log_level,
+        log_file_path=settings.log_file_path,
+        log_max_bytes=settings.log_max_bytes,
+        log_backup_count=settings.log_backup_count,
     )
 
-    # ── 3. Проверки ────────────────────────────────────────────────────
-    print(f"\n[3/4] Запуск проверок: {', '.join(check_names)}")
-    results, summaries = run_checks(
-        check_names, base_url, urls, pages, args, verbose=verbose,
-    )
+    # ── Подготовка параметров ─────────────────────────────────
+    params = _build_params(args, settings)
 
-    # ── 4. Отчёты ──────────────────────────────────────────────────────
-    print(f"\n[4/4] Генерация отчётов...")
-    save_all(
-        results, summaries,
-        base_url=base_url,
-        output_dir=args.output_dir,
-        excel_name=args.excel_name,
-        html_name=args.html_name,
-    )
+    # ── Валидация имён проверок ────────────────────────────────
+    invalid = AuditService.validate_check_names(params.check_names)
+    if invalid:
+        print(f"Неизвестные проверки: {', '.join(invalid)}")
+        print(f"Доступные: {', '.join(ALL_CHECKS.keys())}")
+        sys.exit(1)
 
-    # ── Итоговая сводка ────────────────────────────────────────────────
-    total = sum(len(rows) for rows in results.values())
+    # ── Запуск аудита ─────────────────────────────────────────
+    verbose = not args.quiet
+    progress_cb = _print_progress if verbose else None
+
+    service = AuditService(settings)
+
+    print(f"\n{'='*60}")
+    print(f"  АУДИТ САЙТА: {params.base_url}")
+    print(f"{'='*60}\n")
+
+    try:
+        result = service.run_audit(params, on_progress=progress_cb)
+    except ValueError as exc:
+        print(f"\nОшибка: {exc}")
+        sys.exit(1)
+
+    # ── Итоговая сводка ───────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"  АУДИТ ЗАВЕРШЁН")
-    print(f"  Сайт:    {base_url}")
-    print(f"  Страниц: {len(urls)}")
-    print(f"  Проблем:  {total}")
+    print(f"  Сайт:      {result.base_url}")
+    print(f"  Страниц:   {result.total_urls}")
+    print(f"  Проблем:   {result.total_issues}")
+    print(f"  Время:     {result.elapsed_seconds} сек")
+    print(f"  Excel:     {result.excel_path}")
+    print(f"  HTML:      {result.html_path}")
     print(f"{'='*60}")
-    for name in check_names:
-        count = len(results.get(name, []))
+
+    for name in params.check_names:
+        count = len(result.results.get(name, []))
         label = ALL_CHECKS[name]["description"]
         marker = "✓" if count == 0 else "✗"
         print(f"  {marker} {label}: {count}")
+
     print(f"{'='*60}\n")
 
 
