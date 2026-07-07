@@ -10,6 +10,7 @@ CLI-оркестратор аудита сайта.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 
 from .config.logger import setup_logging
@@ -149,10 +150,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"{'='*60}\n")
 
     try:
-        result = service.run_audit(params, on_progress=progress_cb)
+        result = asyncio.run(
+            service.run_audit_async(params, on_progress=progress_cb),
+        )
     except ValueError as exc:
         print(f"\nОшибка: {exc}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n\nАудит прерван пользователем.")
+        sys.exit(130)
 
     # ── Итоговая сводка ───────────────────────────────────────
     print(f"\n{'='*60}")

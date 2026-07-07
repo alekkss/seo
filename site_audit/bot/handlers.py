@@ -7,6 +7,10 @@
     setting:*    → настройка параметров
     audit:*      → запуск аудита
 
+Аудит запускается как asyncio.Task (вместо threading.Thread),
+что позволяет использовать await для отправки прогресса
+и избежать проблем с межпоточной синхронизацией.
+
 Использование:
     from site_audit.bot.handlers import register_handlers
 
@@ -15,7 +19,8 @@
 
 from __future__ import annotations
 
-import threading
+import asyncio
+import traceback
 from typing import Any
 
 from telegram import InlineKeyboardMarkup, Update
@@ -234,11 +239,15 @@ async def _handle_url_input(
     url = text.strip()
 
     if not url:
-        await update.message.reply_text("❌ URL не может быть пустым. Попробуйте ещё раз:")
+        await update.message.reply_text(
+            "❌ URL не может быть пустым. Попробуйте ещё раз:"
+        )
         return
 
     if " " in url:
-        await update.message.reply_text("❌ URL не должен содержать пробелов. Попробуйте ещё раз:")
+        await update.message.reply_text(
+            "❌ URL не должен содержать пробелов. Попробуйте ещё раз:"
+        )
         return
 
     if not url.startswith(("http://", "https://")):
@@ -339,13 +348,12 @@ async def handle_callback(
 
     # Блокируем действия во время аудита
     if session.state == UserState.AUDIT_RUNNING and data != CB_CANCEL:
-        await query.answer("⏳ Дождитесь завершения аудита.", show_alert=True)
+        await query.answer(
+            "⏳ Дождитесь завершения аудита.", show_alert=True
+        )
         return
 
     # ── Маршрутизация по callback-данным ──────────────────────
-    # ВАЖНО: точные совпадения проверяются ДО startswith,
-    # чтобы "check:back" не попало в обработку toggle проверки.
-
     if data == CB_NEW_AUDIT:
         await _cb_new_audit(query, session)
 
@@ -417,20 +425,33 @@ async def _cb_select_checks(query: Any, session: UserSession) -> None:
     )
 
 
-async def _cb_check_toggle(query: Any, session: UserSession, data: str) -> None:
+async def _cb_check_toggle(
+    query: Any,
+    session: UserSession,
+    data: str,
+) -> None:
     """Переключение одной проверки."""
     check_name = data.split(":", 1)[1]
     session.toggle_check(check_name)
 
-    await _safe_edit_markup(query, reply_markup=build_checks_keyboard(session))
+    await _safe_edit_markup(
+        query, reply_markup=build_checks_keyboard(session)
+    )
 
 
-async def _cb_checks_all(query: Any, session: UserSession, *, enabled: bool) -> None:
+async def _cb_checks_all(
+    query: Any,
+    session: UserSession,
+    *,
+    enabled: bool,
+) -> None:
     """Включение или выключение всех проверок."""
     for name in session.selected_checks:
         session.selected_checks[name] = enabled
 
-    await _safe_edit_markup(query, reply_markup=build_checks_keyboard(session))
+    await _safe_edit_markup(
+        query, reply_markup=build_checks_keyboard(session)
+    )
 
 
 async def _cb_back_to_menu(query: Any, session: UserSession) -> None:
@@ -461,7 +482,11 @@ async def _cb_settings(query: Any, session: UserSession) -> None:
     )
 
 
-async def _cb_setting_select(query: Any, session: UserSession, data: str) -> None:
+async def _cb_setting_select(
+    query: Any,
+    session: UserSession,
+    data: str,
+) -> None:
     """Пользователь выбрал параметр для редактирования."""
     key = data.split(":", 1)[1]
 
@@ -507,7 +532,9 @@ async def _cb_toggle_external(query: Any, session: UserSession) -> None:
         }},
     )
 
-    await _safe_edit_markup(query, reply_markup=build_settings_keyboard(session))
+    await _safe_edit_markup(
+        query, reply_markup=build_settings_keyboard(session)
+    )
 
 
 async def _cb_run_audit(
@@ -515,7 +542,7 @@ async def _cb_run_audit(
     session: UserSession,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Запуск аудита в фоновом потоке."""
+    """Запуск аудита как asyncio.Task в том же event loop."""
     if not session.url:
         await _safe_edit_text(
             query,
@@ -526,7 +553,9 @@ async def _cb_run_audit(
 
     enabled_checks = session.get_enabled_checks()
     if not enabled_checks:
-        await query.answer("⚠️ Выберите хотя бы одну проверку!", show_alert=True)
+        await query.answer(
+            "⚠️ Выберите хотя бы одну проверку!", show_alert=True
+        )
         return
 
     session.state = UserState.AUDIT_RUNNING
@@ -552,6 +581,7 @@ async def _cb_run_audit(
 
     audit_service: AuditService = context.bot_data["audit_service"]
     settings: Settings = context.bot_data["settings"]
+    bot = context.bot
     chat_id = query.message.chat_id
 
     params = AuditParams(
@@ -571,39 +601,102 @@ async def _cb_run_audit(
         html_name=settings.html_report_name,
     )
 
-    thread = threading.Thread(
-        target=_run_audit_thread,
-        args=(context.application, chat_id, session, audit_service, params),
-        daemon=True,
+    # Запускаем аудит как фоновую async-задачу в том же event loop
+    asyncio.create_task(
+        _run_audit_task(bot, chat_id, session, audit_service, params),
+        name=f"audit_{session.user_id}",
     )
-    thread.start()
 
 
-def _run_audit_thread(
-    application: Application,  # type: ignore[type-arg]
+async def _run_audit_task(
+    bot: Any,
     chat_id: int,
     session: UserSession,
     audit_service: AuditService,
     params: AuditParams,
 ) -> None:
     """
-    Выполняет аудит в фоновом потоке.
+    Выполняет аудит как asyncio.Task.
 
-    Отправляет все сообщения о прогрессе в чат.
-    Сообщения о загрузке страниц (⬇️ Загружено X/Y) отправляются
-    каждое 3-е, чтобы не спамить. Все остальные — отправляются всегда.
+    Преимущества перед threading.Thread:
+      - Работает в том же event loop, что и бот.
+      - Можно напрямую await для отправки сообщений.
+      - Нет проблем с межпоточной синхронизацией.
+      - Нет необходимости в job_queue.run_once для планирования.
+
+    Прогресс-сообщения отправляются напрямую через bot.send_message.
+    Сообщения о промежуточной загрузке (⬇️ Загружено X/Y)
+    пропускаются, чтобы не спамить чат.
+
+    Args:
+        bot: объект бота для отправки сообщений.
+        chat_id: ID чата для отправки результатов.
+        session: сессия пользователя.
+        audit_service: сервис аудита.
+        params: параметры аудита.
     """
+
+    async def _send_message(
+        text: str,
+        *,
+        parse_mode: str | None = None,
+    ) -> None:
+        """Безопасная отправка сообщения в чат."""
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось отправить сообщение в чат",
+                extra={"context": {
+                    "chat_id": chat_id,
+                    "error": str(exc),
+                }},
+            )
+
+    async def _send_file(file_path: str, caption: str) -> None:
+        """Безопасная отправка файла в чат."""
+        try:
+            with open(file_path, "rb") as f:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    caption=caption,
+                )
+        except FileNotFoundError:
+            await _send_message(f"⚠️ Файл не найден: {file_path}")
+        except Exception as exc:
+            logger.warning(
+                "Не удалось отправить файл",
+                extra={"context": {
+                    "chat_id": chat_id,
+                    "file_path": file_path,
+                    "error": str(exc),
+                }},
+            )
+
     def on_progress(message: str) -> None:
-        """Callback прогресса — отправляет сообщение в Telegram."""
-        # Сообщения о промежуточном прогрессе загрузки фильтруем,
-        # чтобы не спамить (они приходят каждые 50 страниц)
+        """
+        Sync-callback для прогресса.
+
+        run_audit_async вызывает on_progress синхронно,
+        поэтому используем asyncio для планирования отправки.
+        Промежуточные сообщения о загрузке пропускаем.
+        """
         if message.startswith("⬇️ Загружено "):
             return
-        _schedule_message(application, chat_id, message)
+        asyncio.ensure_future(_send_message(message))
 
     try:
-        result = audit_service.run_audit(params, on_progress=on_progress)
+        result = await audit_service.run_audit_async(
+            params,
+            on_progress=on_progress,
+        )
 
+        # Формируем итоговое сообщение
         summary_lines = [
             "✅ *Аудит завершён!*\n",
             f"🌐 Сайт: `{result.base_url}`",
@@ -621,10 +714,16 @@ def _run_audit_thread(
 
         summary_text = "\n".join(summary_lines)
 
-        _schedule_message(application, chat_id, summary_text, parse_mode="Markdown")
-        _schedule_file(application, chat_id, result.excel_path, "📊 Excel-отчёт")
-        _schedule_file(application, chat_id, result.html_path, "📄 HTML-отчёт")
-        _schedule_keyboard(application, chat_id, build_audit_done_keyboard())
+        await _send_message(summary_text, parse_mode="Markdown")
+        await _send_file(result.excel_path, "📊 Excel-отчёт")
+        await _send_file(result.html_path, "📄 HTML-отчёт")
+
+        # Кнопки после завершения
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Выберите действие:",
+            reply_markup=build_audit_done_keyboard(),
+        )
 
         logger.info(
             "Аудит из бота завершён успешно",
@@ -632,6 +731,7 @@ def _run_audit_thread(
                 "user_id": session.user_id,
                 "url": result.base_url,
                 "issues": result.total_issues,
+                "elapsed": result.elapsed_seconds,
             }},
         )
 
@@ -641,8 +741,13 @@ def _run_audit_thread(
             f"`{type(exc).__name__}: {exc}`\n\n"
             f"Попробуйте изменить параметры или проверьте URL."
         )
-        _schedule_message(application, chat_id, error_text, parse_mode="Markdown")
-        _schedule_keyboard(application, chat_id, build_audit_done_keyboard())
+        await _send_message(error_text, parse_mode="Markdown")
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Выберите действие:",
+            reply_markup=build_audit_done_keyboard(),
+        )
 
         logger.error(
             "Ошибка аудита из бота",
@@ -650,72 +755,27 @@ def _run_audit_thread(
                 "user_id": session.user_id,
                 "url": params.base_url,
                 "error": str(exc),
+                "traceback": traceback.format_exc(),
             }},
-            exc_info=True,
         )
 
     finally:
         session.state = UserState.MENU
 
 
-# ── Вспомогательные функции для отправки из потока ────────────
-
-def _schedule_message(
-    application: Application,  # type: ignore[type-arg]
-    chat_id: int,
-    text: str,
-    *,
-    parse_mode: str | None = None,
+async def _cb_cancel(
+    query: Any,
+    session: UserSession,
+    session_manager: SessionManager,
 ) -> None:
-    """Планирует отправку сообщения из фонового потока."""
-    async def _send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=parse_mode,
-        )
+    """Отмена и сброс сессии."""
+    session_manager.reset(session.user_id)
 
-    application.job_queue.run_once(_send, when=0)  # type: ignore[union-attr]
-
-
-def _schedule_file(
-    application: Application,  # type: ignore[type-arg]
-    chat_id: int,
-    file_path: str,
-    caption: str,
-) -> None:
-    """Планирует отправку файла из фонового потока."""
-    async def _send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            with open(file_path, "rb") as f:
-                await ctx.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    caption=caption,
-                )
-        except FileNotFoundError:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Файл не найден: {file_path}",
-            )
-
-    application.job_queue.run_once(_send, when=0)  # type: ignore[union-attr]
-
-
-def _schedule_keyboard(
-    application: Application,  # type: ignore[type-arg]
-    chat_id: int,
-    reply_markup: Any,
-) -> None:
-    """Планирует отправку сообщения с клавиатурой из фонового потока."""
-    async def _send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text="Выберите действие:",
-            reply_markup=reply_markup,
-        )
-
-    application.job_queue.run_once(_send, when=0)  # type: ignore[union-attr]
+    await _safe_edit_text(
+        query,
+        "👋 Сессия завершена.\n\n"
+        "Нажмите /start, чтобы начать новый аудит.",
+    )
 
 
 # ── Регистрация обработчиков ──────────────────────────────────
@@ -742,21 +802,8 @@ def register_handlers(
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
 
     logger.info("Обработчики бота зарегистрированы")
-
-
-async def _cb_cancel(
-    query: Any,
-    session: UserSession,
-    session_manager: SessionManager,
-) -> None:
-    """Отмена и сброс сессии."""
-    session_manager.reset(session.user_id)
-
-    await _safe_edit_text(
-        query,
-        "👋 Сессия завершена.\n\n"
-        "Нажмите /start, чтобы начать новый аудит.",
-    )

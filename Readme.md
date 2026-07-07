@@ -27,13 +27,13 @@
 
 ### Требования
 
-- Python 3.10+
+- Python 3.11+
 - pip
 
 ### Зависимости
 
 ```bash
-pip install requests beautifulsoup4 lxml openpyxl python-dotenv "python-telegram-bot[job-queue]"
+pip install requests beautifulsoup4 lxml openpyxl python-dotenv "python-telegram-bot[job-queue]" aiohttp[speedups]
 ```
 
 ### Конфигурация
@@ -58,8 +58,8 @@ cp .env.example .env
 └── site_audit/
     ├── __init__.py
     ├── __main__.py          # CLI-оркестратор
-    ├── utils.py             # HTTP-клиент, хелперы
-    ├── crawler.py           # Sitemap + обход по ссылкам
+    ├── utils.py             # Синхронный и асинхронный HTTP-клиент, хелперы
+    ├── crawler.py           # Асинхронный Sitemap + обход по ссылкам
     ├── report.py            # Генерация Excel и HTML
     ├── config/
     │   ├── __init__.py
@@ -263,17 +263,17 @@ ALLOWED_USER_IDS=123456789,987654321
 
 ```
 1. Сбор URL
-   ├── Пробует скачать sitemap.xml / sitemap_index.xml
-   └── Если sitemap нет → BFS-обход по внутренним ссылкам
+   ├── Асинхронно пробует скачать sitemap.xml / sitemap_index.xml
+   ├── Вложенные sitemap загружаются параллельно
+   └── Если sitemap нет → асинхронный BFS-обход по внутренним ссылкам
 
 2. Загрузка страниц
-   └── Параллельное скачивание HTML всех найденных URL
+   └── Асинхронное скачивание через aiohttp (до 100 одновременных соединений)
 
 3. Проверки
    ├── Каждая проверка получает уже скачанные страницы
    ├── Не делает повторных запросов к уже загруженным URL
-   └── Дополнительные запросы только для внешних ресурсов
-       (картинки, внешние ссылки, редиректы)
+   └── Дополнительные запросы (картинки, ссылки, редиректы) — асинхронные
 
 4. Отчёты
    └── Генерация Excel + HTML из результатов всех проверок
@@ -337,7 +337,7 @@ setup_logging(log_level=settings.log_level, log_file_path=settings.log_file_path
 # Создание сервиса
 service = AuditService(settings)
 
-# Запуск аудита с параметрами из .env
+# Синхронный запуск (обёртка над asyncio.run)
 params = service.create_params_from_settings("https://example.com")
 result = service.run_audit(params)
 
@@ -346,16 +346,34 @@ print(f"Excel: {result.excel_path}")
 print(f"HTML: {result.html_path}")
 ```
 
-```python
+# Асинхронный запуск (рекомендуется)
+import asyncio
+from site_audit.config import get_settings, setup_logging
+from site_audit.services import AuditService
+
+settings = get_settings()
+setup_logging(log_level=settings.log_level, log_file_path=settings.log_file_path)
+
+service = AuditService(settings)
+params = service.create_params_from_settings("https://example.com")
+
+async def main():
+    result = await service.run_audit_async(params)
+    print(f"Проблем найдено: {result.total_issues}")
+
+asyncio.run(main())
+
+
 # Низкоуровневое использование (без сервиса)
-from site_audit.crawler import try_sitemap, crawl
+import asyncio
+from site_audit.crawler import async_try_sitemap
 from site_audit.checks import seo, empty_pages, broken_links
 from site_audit.utils import fetch, parse_html, visible_text
 
-# Собрать URL
-urls = try_sitemap("https://example.com")
+# Собрать URL (асинхронно)
+urls = asyncio.run(async_try_sitemap("https://example.com"))
 
-# Проверить одну страницу
+# Проверить одну страницу (синхронно)
 result = seo.check("https://example.com/about")
 print(result["issues"])
 
@@ -364,7 +382,7 @@ pages = [{"url": u, "resp": None, "html": None} for u in urls]
 seo_results = seo.check_many(pages)
 for r in seo.filter_with_issues(seo_results):
     print(r["url"], r["issues"])
-```
+
 
 ---
 
@@ -401,6 +419,10 @@ A: Укажите Telegram ID пользователей в `.env`: `ALLOWED_USE
 **Q: Где хранятся логи?**
 
 A: По умолчанию в `./logs/app.log`. Путь настраивается через `LOG_FILE_PATH` в `.env`.
+
+**Q: Зачем нужен aiohttp, если уже есть requests?**
+
+A: `requests` — синхронная библиотека, каждый поток блокируется в ожидании ответа сервера. `aiohttp` — асинхронная, один поток обрабатывает десятки соединений одновременно. Для массовых операций (загрузка 5000+ страниц, проверка ссылок и картинок) это даёт ускорение в 5–10 раз. `requests` остаётся в проекте для точечных запросов.
 
 ---
 
