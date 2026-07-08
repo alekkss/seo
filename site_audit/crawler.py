@@ -54,6 +54,7 @@ async def async_try_sitemap(
     base_url: str,
     *,
     timeout: int | None = None,
+    retries: int | None = None,
     verbose: bool = True,
 ) -> set[str]:
     """
@@ -65,6 +66,7 @@ async def async_try_sitemap(
     Args:
         base_url: корневой URL сайта.
         timeout: таймаут HTTP-запросов в секундах (None — из настроек).
+        retries: количество повторов при ошибках (None — из настроек).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
@@ -72,7 +74,7 @@ async def async_try_sitemap(
     """
     settings = get_settings()
     _timeout = timeout if timeout is not None else settings.default_timeout
-    _retries = settings.default_retries
+    _retries = retries if retries is not None else settings.default_retries
 
     candidates = [
         urljoin(base_url, "/sitemap.xml"),
@@ -219,6 +221,7 @@ async def async_crawl(
     max_depth: int = 3,
     max_concurrent: int = 20,
     timeout: int | None = None,
+    retries: int | None = None,
     delay: float = 0.0,
     verbose: bool = True,
 ) -> list[str]:
@@ -236,6 +239,7 @@ async def async_crawl(
         max_depth: максимальная глубина обхода.
         max_concurrent: количество одновременных запросов.
         timeout: таймаут HTTP-запросов в секундах (None — из настроек).
+        retries: количество повторов при ошибках (None — из настроек).
         delay: задержка между запросами (для защиты от бана).
         verbose: выводить ли прогресс в консоль.
 
@@ -244,7 +248,7 @@ async def async_crawl(
     """
     settings = get_settings()
     _timeout = timeout if timeout is not None else settings.default_timeout
-    _retries = settings.default_retries
+    _retries = retries if retries is not None else settings.default_retries
 
     domain = get_domain(base_url)
     seen: set[str] = {base_url}

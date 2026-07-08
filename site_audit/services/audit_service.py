@@ -1,26 +1,19 @@
 """
 Сервис аудита сайта.
-
 Инкапсулирует полный цикл: сбор URL → загрузка страниц → проверки → генерация отчётов.
 Используется как единая точка входа для CLI и Telegram-бота.
-
 Основной метод — run_audit_async (асинхронный).
 Синхронная обёртка run_audit сохранена для обратной совместимости.
-
 Использование:
-    from site_audit.services import AuditService
-    from site_audit.config import get_settings
-
-    settings = get_settings()
-    service = AuditService(settings)
-
-    # Асинхронный вызов
-    result = await service.run_audit_async(params)
-
-    # Синхронный вызов (обёртка над asyncio.run)
-    result = service.run_audit(params)
+from site_audit.services import AuditService
+from site_audit.config import get_settings
+settings = get_settings()
+service = AuditService(settings)
+# Асинхронный вызов
+result = await service.run_audit_async(params)
+# Синхронный вызов (обёртка над asyncio.run)
+result = service.run_audit(params)
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -94,7 +87,11 @@ class AuditParams:
     limit: int = 0
     workers: int = 10
     delay: float = 0.0
-    timeout: int = 15
+    
+    # Сетевые настройки (увеличены для устойчивости к медленным серверам)
+    timeout: int = 30
+    retries: int = 3
+    
     min_text_length: int = 100
     max_image_size_kb: int = 500
     check_external_links: bool = False
@@ -120,12 +117,10 @@ class AuditResult:
 class AuditService:
     """
     Сервис выполнения полного цикла аудита сайта.
-
     Принимает настройки через конструктор (Dependency Injection),
-    не зависит от конкретной точки входа (CLI/бот).
-
-    Основной метод — run_audit_async (асинхронный).
-    Метод run_audit — синхронная обёртка для удобства вызова.
+     не зависит от конкретной точки входа (CLI/бот).
+     Основной метод — run_audit_async (асинхронный).
+     Метод run_audit — синхронная обёртка для удобства вызова.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -173,6 +168,7 @@ class AuditService:
             workers=s.default_workers,
             delay=s.default_delay,
             timeout=s.default_timeout,
+            retries=s.default_retries,
             min_text_length=s.default_min_text_length,
             max_image_size_kb=s.default_max_image_size_kb,
             check_external_links=s.default_check_external_links,
@@ -193,7 +189,6 @@ class AuditService:
     ) -> AuditResult:
         """
         Синхронная обёртка над run_audit_async.
-
         Создаёт новый event loop и запускает асинхронный аудит.
         Используется из CLI и других синхронных контекстов.
 
@@ -221,7 +216,6 @@ class AuditService:
     ) -> AuditResult:
         """
         Запускает полный цикл аудита асинхронно.
-
         Этапы:
           1. Сбор URL (sitemap / BFS-обход) — async
           2. Загрузка страниц (aiohttp + семафор) — async
@@ -249,12 +243,12 @@ class AuditService:
             "Аудит запущен",
             extra={"context": {"url": base_url, "trace_id": trace_id}},
         )
+
         self._notify(on_progress, f"🔍 Начинаю аудит: {base_url}")
 
         # ── 1. Сбор URL ──────────────────────────────────────────
         self._notify(on_progress, "📋 Этап 1/4: Сбор URL...")
         urls = await self._collect_urls_async(base_url, params)
-
         if not urls:
             raise ValueError(
                 f"Не найдено ни одного URL на сайте {base_url}. "
@@ -270,7 +264,6 @@ class AuditService:
         # ── 2. Загрузка страниц ──────────────────────────────────
         self._notify(on_progress, f"⬇️ Этап 2/4: Загрузка {len(urls)} страниц...")
         pages = await self._download_pages_async(urls, params, on_progress)
-
         ok_count = sum(1 for p in pages if p["html"] is not None)
         self._notify(on_progress, f"⬇️ Загружено с HTML: {ok_count}/{len(urls)}")
         logger.info(
@@ -286,7 +279,6 @@ class AuditService:
         results, summaries = await self._run_checks_async(
             base_url, urls, pages, params, on_progress,
         )
-
         total_issues = sum(len(rows) for rows in results.values())
         self._notify(on_progress, f"🔎 Проверки завершены. Проблем: {total_issues}")
         logger.info(
@@ -296,7 +288,6 @@ class AuditService:
 
         # ── 4. Отчёты ────────────────────────────────────────────
         self._notify(on_progress, "📊 Этап 4/4: Генерация отчётов...")
-
         loop = asyncio.get_running_loop()
         excel_path, html_path = await loop.run_in_executor(
             None,
@@ -351,8 +342,12 @@ class AuditService:
         Returns:
             Список URL для проверки.
         """
-        urls_set = await async_try_sitemap(base_url, timeout=params.timeout, verbose=False)
-
+        urls_set = await async_try_sitemap(
+            base_url,
+            timeout=params.timeout,
+            retries=params.retries,
+            verbose=False,
+        )
         if urls_set:
             logger.info(
                 "URL получены из sitemap",
@@ -367,6 +362,7 @@ class AuditService:
                 max_depth=params.max_depth,
                 max_concurrent=params.workers,
                 timeout=params.timeout,
+                retries=params.retries,
                 delay=params.delay,
                 verbose=False,
             )
@@ -388,13 +384,12 @@ class AuditService:
     ) -> list[dict[str, Any]]:
         """
         Асинхронно загружает HTML всех URL через aiohttp.
-
         Использует семафор для ограничения количества одновременных запросов.
         Переиспользует одну TCP-сессию для всех запросов.
 
         Args:
             urls: список URL для загрузки.
-            params: параметры аудита (workers, timeout, delay).
+            params: параметры аудита (workers, timeout, retries, delay).
             on_progress: callback для прогресса.
 
         Returns:
@@ -402,11 +397,10 @@ class AuditService:
         """
         max_concurrent = min(params.workers * 5, 100)
         semaphore = asyncio.Semaphore(max_concurrent)
-
         session = create_aiohttp_session(
             max_concurrent=max_concurrent,
-            timeout_total=params.timeout + 10,
-            timeout_connect=min(params.timeout, 10),
+            timeout_total=params.timeout + 30,
+            timeout_connect=min(10, params.timeout),
         )
 
         try:
@@ -415,7 +409,7 @@ class AuditService:
                 session=session,
                 semaphore=semaphore,
                 timeout=params.timeout,
-                retries=2,
+                retries=params.retries,
                 delay=params.delay,
                 on_progress=on_progress,
                 progress_every=150,
@@ -432,7 +426,6 @@ class AuditService:
             html: str | None = None
             if is_async_response_ok(resp):
                 html = resp.text
-
             pages.append({
                 "url": resp.url,
                 "resp": resp,
@@ -455,11 +448,9 @@ class AuditService:
     ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
         """
         Выполняет выбранные проверки над загруженными страницами.
-
         CPU-bound проверки (seo, empty_pages, duplicates, placeholders)
         запускаются в ThreadPoolExecutor через run_in_executor,
         чтобы не блокировать event loop.
-
         IO-bound проверки (broken_links, images) выполняются
         в executor с внутренним async event loop.
 
@@ -477,6 +468,7 @@ class AuditService:
         summaries: dict[str, str] = {}
         domain = get_domain(base_url)
         check_workers = min(params.workers, 5)
+
         loop = asyncio.get_running_loop()
 
         for name in params.check_names:
@@ -495,6 +487,7 @@ class AuditService:
                 "Запуск проверки",
                 extra={"context": {"check": name, "description": description}},
             )
+
             AuditService._notify(on_progress, f"🔎 {description}...")
 
             t0 = time.time()
@@ -541,7 +534,6 @@ class AuditService:
     ) -> list[dict[str, Any]]:
         """
         Выполняет одну конкретную проверку, возвращает список проблем.
-
         Вызывается из executor (отдельного потока).
 
         Args:
@@ -556,38 +548,38 @@ class AuditService:
         Returns:
             Список найденных проблем.
         """
-        compatible_pages = _make_compatible_pages(pages)
+        compatible_page = _make_compatible_pages(pages)
 
         if name == "empty_pages":
             res = mod.check_many(
-                compatible_pages,
+                compatible_page,
                 min_text_length=params.min_text_length,
             )
             return mod.filter_empty(res)
 
         if name == "seo":
-            res = mod.check_many(compatible_pages)
+            res = mod.check_many(compatible_page)
             return mod.filter_with_issues(res)
 
         if name == "broken_links":
             return mod.check(
-                compatible_pages,
+                compatible_page,
                 check_external=params.check_external_links,
                 workers=check_workers,
             )
 
         if name == "images":
             return mod.check(
-                compatible_pages,
+                compatible_page,
                 max_size_kb=params.max_image_size_kb,
                 workers=check_workers,
             )
 
         if name == "duplicates":
-            return mod.check(compatible_pages, verbose=False)
+            return mod.check(compatible_page, verbose=False)
 
         if name == "placeholders":
-            return mod.check_many(compatible_pages, verbose=False)
+            return mod.check_many(compatible_page, verbose=False)
 
         return []
 
@@ -657,16 +649,13 @@ def _make_compatible_pages(
     """
     Конвертирует страницы с AsyncResponse в формат,
     совместимый с существующими модулями проверок.
-
     Проверки ожидают:
-      - page["html"] — строка HTML или None
-      - page["resp"] — объект с атрибутами status_code, headers, text, url
-        (или None / Exception)
-
+       - page["html"] — строка HTML или None
+       - page["resp"] — объект с атрибутами status_code, headers, text, url
+         (или None / Exception)
     AsyncResponse уже имеет status_code (через property), headers (dict),
     text и url — поэтому он совместим с проверками, которые используют
     resp.status_code, resp.headers.get(...), resp.text, resp.url.
-
     Для проверок, которые проверяют isinstance(resp, Exception),
     создаём Exception из resp.error при наличии ошибки.
 
@@ -677,7 +666,6 @@ def _make_compatible_pages(
         Список страниц в совместимом формате.
     """
     compatible: list[dict[str, Any]] = []
-
     for page in pages:
         resp = page.get("resp")
         new_page: dict[str, Any] = {
