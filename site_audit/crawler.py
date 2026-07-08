@@ -165,7 +165,13 @@ async def _parse_sitemap(
                         depth=depth + 1,
                     )
                 )
-        await asyncio.gather(*tasks)
+        # CRITICAL: return_exceptions=True, чтобы один таймаут sitemap
+        # не ломал обработку остальных вложенных карт
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                # Логируем, но не прерываем работу
+                pass
         return
 
     # обычный sitemap → URL страниц
@@ -241,8 +247,12 @@ async def async_crawl(
                 if not is_async_response_ok(resp):
                     continue
 
-                # Извлекаем ссылки из HTML
-                links = extract_links(resp.text, resp.url)
+                # Извлекаем ссылки из HTML с защитой от ошибок парсинга
+                try:
+                    links = extract_links(resp.text, resp.url)
+                except Exception:
+                    # Повреждённый HTML или другая ошибка парсинга — пропускаем
+                    continue
 
                 for link in links["internal"]:
                     if link in seen:
@@ -289,6 +299,10 @@ async def _fetch_layer(
     """
     Загружает все URL одного уровня глубины параллельно.
 
+    CRITICAL: return_exceptions=True — чтобы один таймаут
+    не ломал загрузку всего слоя BFS. Исключения оборачиваются
+    в AsyncResponse с описанием ошибки.
+
     Args:
         urls: список URL текущего слоя BFS.
         session: aiohttp-сессия.
@@ -303,16 +317,44 @@ async def _fetch_layer(
     async def _fetch_one(url: str) -> AsyncResponse:
         if delay > 0:
             await asyncio.sleep(delay)
-        return await async_fetch(
-            url,
-            session=session,
-            semaphore=semaphore,
-            timeout=timeout,
-            retries=1,
-        )
+        try:
+            return await async_fetch(
+                url,
+                session=session,
+                semaphore=semaphore,
+                timeout=timeout,
+                retries=1,
+            )
+        except Exception as exc:
+            # Защита от неожиданных исключений — оборачиваем в AsyncResponse
+            return AsyncResponse(
+                url=url,
+                error=f"Ошибка задачи: {type(exc).__name__}: {exc}",
+                ok=False,
+            )
 
     tasks = [_fetch_one(url) for url in urls]
-    return await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Оборачиваем любые исключения из gather в AsyncResponse
+    final_results: list[AsyncResponse] = []
+    for url, result in zip(urls, results):
+        if isinstance(result, AsyncResponse):
+            final_results.append(result)
+        elif isinstance(result, Exception):
+            final_results.append(AsyncResponse(
+                url=url,
+                error=f"Ошибка задачи: {type(result).__name__}: {result}",
+                ok=False,
+            ))
+        else:
+            final_results.append(AsyncResponse(
+                url=url,
+                error=f"Неизвестный результат задачи: {type(result).__name__}",
+                ok=False,
+            ))
+
+    return final_results
 
 
 # ═════════════════════════════════════════════════════════════════════════════

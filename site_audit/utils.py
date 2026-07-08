@@ -39,8 +39,10 @@ TAGS_TO_STRIP: list[str] = [
 ]
 
 # Таймауты по умолчанию для aiohttp (общий и на соединение)
-_DEFAULT_AIOHTTP_TIMEOUT_TOTAL: int = 30
+_DEFAULT_AIOHTTP_TIMEOUT_TOTAL: int = 60
 _DEFAULT_AIOHTTP_TIMEOUT_CONNECT: int = 10
+_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT: int = 10
+_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ: int = 45
 
 # Максимальное количество одновременных соединений в пуле aiohttp
 _DEFAULT_CONNECTOR_LIMIT: int = 100
@@ -136,6 +138,8 @@ def create_aiohttp_session(
     timeout = aiohttp.ClientTimeout(
         total=timeout_total,
         connect=timeout_connect,
+        sock_connect=_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT,
+        sock_read=_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ,
     )
 
     return aiohttp.ClientSession(
@@ -184,11 +188,14 @@ async def async_fetch(
     Returns:
         AsyncResponse с данными ответа.
     """
-    result = AsyncResponse(url=url, final_url=url)
-
     request_timeout: aiohttp.ClientTimeout | None = None
     if timeout is not None:
-        request_timeout = aiohttp.ClientTimeout(total=timeout)
+        request_timeout = aiohttp.ClientTimeout(
+            total=timeout,
+            connect=min(timeout_connect, timeout) if (timeout_connect := _DEFAULT_AIOHTTP_TIMEOUT_CONNECT) else timeout,
+            sock_connect=min(_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT, timeout),
+            sock_read=min(_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ, timeout),
+        )
 
     async def _do_request() -> AsyncResponse:
         last_error = ""
@@ -238,6 +245,8 @@ async def async_fetch(
 
             except asyncio.TimeoutError:
                 last_error = f"Таймаут запроса к {url}"
+            except aiohttp.ClientConnectorError as exc:
+                last_error = f"Ошибка подключения к {url}: {exc}"
             except aiohttp.ClientError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             except OSError as exc:
@@ -247,14 +256,18 @@ async def async_fetch(
             if attempt < retries:
                 should_retry = bool(last_error) or last_status in _RETRY_STATUS_CODES
                 if should_retry:
-                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    wait_time = retry_delay * (attempt + 1)
+                    await asyncio.sleep(wait_time)
                 else:
                     break
 
-        # Все попытки исчерпаны
-        result.error = last_error
-        result.status = last_status
-        return result
+        # Все попытки исчерпаны — возвращаем объект с ошибкой
+        return AsyncResponse(
+            url=url,
+            status=last_status,
+            error=last_error,
+            ok=False,
+        )
 
     if semaphore is not None:
         async with semaphore:
@@ -337,6 +350,9 @@ async def async_fetch_many(
     Все запросы выполняются конкурентно через asyncio.gather,
     а семафор ограничивает количество одновременных соединений.
 
+    CRITICAL: return_exceptions=True — чтобы один таймаут не ломал весь батч.
+    Если задача падает с исключением, она оборачивается в AsyncResponse с ошибкой.
+
     Args:
         urls: список URL для загрузки.
         session: переиспользуемая aiohttp-сессия.
@@ -360,13 +376,22 @@ async def async_fetch_many(
         if delay > 0:
             await asyncio.sleep(delay)
 
-        resp = await async_fetch(
-            url,
-            session=session,
-            semaphore=semaphore,
-            timeout=timeout,
-            retries=retries,
-        )
+        try:
+            resp = await async_fetch(
+                url,
+                session=session,
+                semaphore=semaphore,
+                timeout=timeout,
+                retries=retries,
+            )
+        except Exception as exc:
+            # Защита от неожиданных исключений (не должно происходить,
+            # но если что-то пролетело мимо — не ломаем весь батч)
+            resp = AsyncResponse(
+                url=url,
+                error=f"Неожиданная ошибка: {type(exc).__name__}: {exc}",
+                ok=False,
+            )
 
         async with lock:
             done_count += 1
@@ -376,7 +401,27 @@ async def async_fetch_many(
         return resp
 
     tasks = [_fetch_one(url) for url in urls]
-    return await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Оборачиваем любые исключения из gather в AsyncResponse
+    final_results: list[AsyncResponse] = []
+    for url, result in zip(urls, results):
+        if isinstance(result, AsyncResponse):
+            final_results.append(result)
+        elif isinstance(result, Exception):
+            final_results.append(AsyncResponse(
+                url=url,
+                error=f"Ошибка задачи: {type(result).__name__}: {result}",
+                ok=False,
+            ))
+        else:
+            final_results.append(AsyncResponse(
+                url=url,
+                error=f"Неизвестный результат задачи: {type(result).__name__}",
+                ok=False,
+            ))
+
+    return final_results
 
 
 # ═════════════════════════════════════════════════════════════════════════════
