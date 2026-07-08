@@ -1,15 +1,12 @@
 """
 Краулер: сбор URL через sitemap.xml и/или асинхронный обход по внутренним ссылкам.
-
 Асинхронные функции:
-  - async_try_sitemap — парсит sitemap.xml / sitemap_index.xml
-  - async_crawl — BFS-обход сайта по внутренним ссылкам
-
+async_try_sitemap — парсит sitemap.xml / sitemap_index.xml
+async_crawl — BFS-обход сайта по внутренним ссылкам
 Синхронные функции (только парсинг HTML, без сети):
-  - extract_links — извлекает внутренние и внешние ссылки со страницы
-  - extract_images — извлекает изображения со страницы
+extract_links — извлекает внутренние и внешние ссылки со страницы
+extract_images — извлекает изображения со страницы
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +14,8 @@ from collections import deque
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
+from .config.logger import get_logger
+from .config.settings import get_settings
 from .utils import (
     AsyncResponse,
     async_fetch,
@@ -27,6 +26,8 @@ from .utils import (
     make_absolute,
     parse_html,
 )
+
+logger = get_logger("crawler")
 
 # Пространство имён для sitemap XML
 _SITEMAP_NS: dict[str, str] = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -52,23 +53,27 @@ _MAX_SITEMAP_DEPTH: int = 3
 async def async_try_sitemap(
     base_url: str,
     *,
-    timeout: int = 15,
+    timeout: int | None = None,
     verbose: bool = True,
 ) -> set[str]:
     """
     Асинхронно собирает URL из sitemap.xml / sitemap_index.xml.
-
     Пробует стандартные пути (/sitemap.xml, /sitemap_index.xml).
     Рекурсивно обрабатывает вложенные sitemap (до глубины 3).
+    Использует настройки из get_settings() для таймаутов и retries.
 
     Args:
         base_url: корневой URL сайта.
-        timeout: таймаут HTTP-запросов в секундах.
+        timeout: таймаут HTTP-запросов в секундах (None — из настроек).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
         Множество найденных URL страниц.
     """
+    settings = get_settings()
+    _timeout = timeout if timeout is not None else settings.default_timeout
+    _retries = settings.default_retries
+
     candidates = [
         urljoin(base_url, "/sitemap.xml"),
         urljoin(base_url, "/sitemap_index.xml"),
@@ -78,9 +83,8 @@ async def async_try_sitemap(
 
     session = create_aiohttp_session(
         max_concurrent=10,
-        timeout_total=timeout,
+        timeout_total=_timeout,
     )
-
     try:
         for candidate in candidates:
             await _parse_sitemap(
@@ -88,7 +92,8 @@ async def async_try_sitemap(
                 session=session,
                 urls=urls,
                 visited=visited_sitemaps,
-                timeout=timeout,
+                timeout=_timeout,
+                retries=_retries,
                 depth=0,
             )
             if urls:
@@ -112,13 +117,14 @@ async def _parse_sitemap(
     urls: set[str],
     visited: set[str],
     timeout: int,
+    retries: int,
     depth: int,
 ) -> None:
     """
     Рекурсивно парсит один sitemap-файл.
-
     Если файл является sitemap_index — рекурсивно загружает
     вложенные карты сайта. Если обычный sitemap — извлекает URL страниц.
+    Все ошибки логируются для диагностики.
 
     Args:
         xml_url: URL файла sitemap.
@@ -126,6 +132,7 @@ async def _parse_sitemap(
         urls: множество для накопления найденных URL.
         visited: множество уже обработанных sitemap-URL.
         timeout: таймаут запроса.
+        retries: количество повторов.
         depth: текущая глубина рекурсии.
     """
     if depth > _MAX_SITEMAP_DEPTH or xml_url in visited:
@@ -136,16 +143,31 @@ async def _parse_sitemap(
         xml_url,
         session=session,
         timeout=timeout,
-        retries=1,
-        retry_delay=1.0,
+        retries=retries,
+        retry_delay=1.5,
     )
 
     if not resp.ok or resp.status != 200:
+        logger.warning(
+            "Не удалось загрузить sitemap",
+            extra={"context": {
+                "url": xml_url,
+                "status": resp.status,
+                "error": resp.error,
+            }},
+        )
         return
 
     try:
         root = ET.fromstring(resp.content)
-    except ET.ParseError:
+    except ET.ParseError as exc:
+        logger.warning(
+            "Ошибка парсинга XML sitemap",
+            extra={"context": {
+                "url": xml_url,
+                "error": str(exc),
+            }},
+        )
         return
 
     # sitemap_index → вложенные карты
@@ -162,6 +184,7 @@ async def _parse_sitemap(
                         urls=urls,
                         visited=visited,
                         timeout=timeout,
+                        retries=retries,
                         depth=depth + 1,
                     )
                 )
@@ -170,8 +193,13 @@ async def _parse_sitemap(
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
-                # Логируем, но не прерываем работу
-                pass
+                logger.error(
+                    "Исключение при парсинге вложенного sitemap",
+                    extra={"context": {
+                        "error_type": type(result).__name__,
+                        "error": str(result),
+                    }},
+                )
         return
 
     # обычный sitemap → URL страниц
@@ -190,43 +218,46 @@ async def async_crawl(
     max_pages: int = 500,
     max_depth: int = 3,
     max_concurrent: int = 20,
-    timeout: int = 15,
+    timeout: int | None = None,
     delay: float = 0.0,
     verbose: bool = True,
 ) -> list[str]:
     """
     Асинхронный BFS-обход сайта по внутренним ссылкам.
-
     Загружает страницы параллельно (ограничено семафором),
     извлекает внутренние ссылки и добавляет их в очередь.
     Работает послойно: сначала все URL глубины 0,
     затем все URL глубины 1 и т.д.
+    Использует настройки из get_settings() для таймаутов и retries.
 
     Args:
         base_url: стартовый URL.
         max_pages: максимальное количество собранных URL.
         max_depth: максимальная глубина обхода.
         max_concurrent: количество одновременных запросов.
-        timeout: таймаут HTTP-запросов в секундах.
+        timeout: таймаут HTTP-запросов в секундах (None — из настроек).
         delay: задержка между запросами (для защиты от бана).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
         Список URL в порядке обнаружения.
     """
+    settings = get_settings()
+    _timeout = timeout if timeout is not None else settings.default_timeout
+    _retries = settings.default_retries
+
     domain = get_domain(base_url)
     seen: set[str] = {base_url}
     collected: list[str] = [base_url]
 
     # Очередь послойного обхода: список URL текущего уровня глубины
     current_layer: list[str] = [base_url]
-
     semaphore = asyncio.Semaphore(max_concurrent)
+
     session = create_aiohttp_session(
         max_concurrent=max_concurrent,
-        timeout_total=timeout,
+        timeout_total=_timeout,
     )
-
     try:
         for depth in range(max_depth):
             if not current_layer or len(collected) >= max_pages:
@@ -237,21 +268,36 @@ async def async_crawl(
                 current_layer,
                 session=session,
                 semaphore=semaphore,
-                timeout=timeout,
+                timeout=_timeout,
+                retries=_retries,
                 delay=delay,
             )
 
             next_layer: list[str] = []
-
             for resp in responses:
                 if not is_async_response_ok(resp):
+                    # Логируем ошибки загрузки для диагностики
+                    if resp.error:
+                        logger.debug(
+                            "Страница не загружена при обходе",
+                            extra={"context": {
+                                "url": resp.url,
+                                "error": resp.error,
+                            }},
+                        )
                     continue
 
                 # Извлекаем ссылки из HTML с защитой от ошибок парсинга
                 try:
                     links = extract_links(resp.text, resp.url)
-                except Exception:
-                    # Повреждённый HTML или другая ошибка парсинга — пропускаем
+                except Exception as exc:
+                    logger.warning(
+                        "Ошибка парсинга HTML при обходе",
+                        extra={"context": {
+                            "url": resp.url,
+                            "error": str(exc),
+                        }},
+                    )
                     continue
 
                 for link in links["internal"]:
@@ -268,7 +314,6 @@ async def async_crawl(
 
                     if len(collected) >= max_pages:
                         break
-
                 if len(collected) >= max_pages:
                     break
 
@@ -294,11 +339,11 @@ async def _fetch_layer(
     session: "aiohttp.ClientSession",  # type: ignore[name-defined]
     semaphore: asyncio.Semaphore,
     timeout: int,
+    retries: int,
     delay: float,
 ) -> list[AsyncResponse]:
     """
     Загружает все URL одного уровня глубины параллельно.
-
     CRITICAL: return_exceptions=True — чтобы один таймаут
     не ломал загрузку всего слоя BFS. Исключения оборачиваются
     в AsyncResponse с описанием ошибки.
@@ -308,12 +353,12 @@ async def _fetch_layer(
         session: aiohttp-сессия.
         semaphore: ограничитель параллельности.
         timeout: таймаут запроса.
+        retries: количество повторов.
         delay: задержка между запросами.
 
     Returns:
         Список AsyncResponse для каждого URL.
     """
-
     async def _fetch_one(url: str) -> AsyncResponse:
         if delay > 0:
             await asyncio.sleep(delay)
@@ -323,10 +368,19 @@ async def _fetch_layer(
                 session=session,
                 semaphore=semaphore,
                 timeout=timeout,
-                retries=1,
+                retries=retries,
+                retry_delay=1.5,
             )
         except Exception as exc:
             # Защита от неожиданных исключений — оборачиваем в AsyncResponse
+            logger.error(
+                "Неожиданная ошибка при загрузке слоя",
+                extra={"context": {
+                    "url": url,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }},
+            )
             return AsyncResponse(
                 url=url,
                 error=f"Ошибка задачи: {type(exc).__name__}: {exc}",
@@ -342,6 +396,14 @@ async def _fetch_layer(
         if isinstance(result, AsyncResponse):
             final_results.append(result)
         elif isinstance(result, Exception):
+            logger.error(
+                "Исключение из gather при загрузке слоя",
+                extra={"context": {
+                    "url": url,
+                    "error_type": type(result).__name__,
+                    "error": str(result),
+                }},
+            )
             final_results.append(AsyncResponse(
                 url=url,
                 error=f"Ошибка задачи: {type(result).__name__}: {result}",
@@ -364,7 +426,6 @@ async def _fetch_layer(
 def extract_links(html: str, page_url: str) -> dict[str, list[str]]:
     """
     Извлекает все ссылки <a href> со страницы.
-
     Разделяет на внутренние и внешние по домену.
     Игнорирует якоря (#), javascript:, mailto:, tel:.
 
@@ -377,6 +438,7 @@ def extract_links(html: str, page_url: str) -> dict[str, list[str]]:
     """
     domain = get_domain(page_url)
     soup = parse_html(html)
+
     internal: list[str] = []
     external: list[str] = []
 
@@ -384,6 +446,7 @@ def extract_links(html: str, page_url: str) -> dict[str, list[str]]:
         href = a["href"].strip()
         if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
             continue
+
         absolute = make_absolute(page_url, href)
         if is_same_domain(absolute, domain):
             internal.append(absolute)
@@ -414,11 +477,13 @@ def extract_images(html: str, page_url: str) -> list[dict[str, str | bool]]:
         # Берём первый src (или первый кандидат из srcset)
         if not src and srcset:
             src = srcset.split(",")[0].strip().split()[0]
+
         if not src:
             continue
 
         absolute = make_absolute(page_url, src)
         alt = img.get("alt")
+
         images.append({
             "src": absolute,
             "alt": alt,

@@ -1,17 +1,14 @@
-# site_audit/checks/seo.py
 """
 Проверка: базовые SEO-элементы страницы.
-
 Что проверяется на каждой странице:
-  - <title>: наличие, пустой ли, слишком короткий
-  - <meta name="description">: наличие, пустой ли
-  - <link rel="canonical">: наличие, совпадает ли с текущим URL
-  - <meta name="robots">: наличие noindex / nofollow
-  - H1: наличие, количество, пустой ли
-  - Open Graph: og:title, og:description, og:image
-  - JSON-LD (<script type="application/ld+json">): наличие, валидность JSON
+<title>: наличие, пустой ли, слишком короткий
+<meta name="description">: наличие, пустой ли
+<link rel="canonical">: наличие, совпадает ли с текущим URL
+<meta name="robots">: наличие noindex / nofollow
+H1: наличие, количество, пустой ли
+Open Graph: og:title, og:description, og:image
+JSON-LD (<script type="application/ld+json">): наличие, валидность JSON
 """
-
 from __future__ import annotations
 
 import json
@@ -19,9 +16,16 @@ import re
 
 import requests
 
+from ..config.logger import get_logger
+from ..config.settings import get_settings
 from ..utils import (
-    fetch, parse_html, is_html_response, normalize_url,
+    fetch,
+    is_html_response,
+    normalize_url,
+    parse_html,
 )
+
+logger = get_logger("checks.seo")
 
 CHECK_NAME = "seo"
 DESCRIPTION = "Базовый SEO-аудит (title, description, canonical, H1, OG, JSON-LD)"
@@ -31,18 +35,48 @@ TITLE_MIN = 10
 
 # ── Основная функция ─────────────────────────────────────────────────────────
 
-def check(url: str, *,
-          resp: requests.Response | None = None,
-          html: str | None = None) -> dict:
+def check(
+    url: str,
+    *,
+    resp: requests.Response | None = None,
+    html: str | None = None,
+) -> dict:
+    """
+    Выполняет SEO-проверку одной страницы.
+    Если resp и html не переданы, делает синхронный запрос через fetch.
+    Все сетевые ошибки логируются и детализируются в отчёте.
+
+    Args:
+        url: URL страницы для проверки.
+        resp: предварительно полученный requests.Response (опционально).
+        html: предварительно полученный HTML-текст (опционально).
+
+    Returns:
+        Словарь с результатами проверки и списком найденных проблем.
+    """
     row = _blank_row(url)
 
+    # Если ответ не передан — делаем запрос сами
     if resp is None and html is None:
-        resp = fetch(url)
+        settings = get_settings()
+        resp = fetch(
+            url,
+            timeout=settings.default_timeout,
+            retries=settings.default_retries,
+        )
 
+    # Обработка ошибок сети
     if isinstance(resp, Exception):
-        row["issues"].append("Ошибка запроса")
+        error_msg = str(resp)
+        logger.warning(
+            "Ошибка запроса при SEO-проверке",
+            extra={"context": {"url": url, "error": error_msg}},
+        )
+        # Детализируем ошибку вместо общего "Ошибка запроса"
+        row["issues"].append(f"Ошибка сети: {error_msg}")
         return row
 
+    # Обработка HTTP-статусов
     if resp is not None:
         row["status_code"] = resp.status_code
         if resp.status_code != 200:
@@ -112,10 +146,10 @@ def check(url: str, *,
 
 # ── Заголовки ────────────────────────────────────────────────────────────────
 
-def _check_headings(soup, row: dict):
+def _check_headings(soup: "BeautifulSoup", row: dict) -> None:  # type: ignore[name-defined]
+    """Проверяет наличие и корректность заголовков H1."""
     h1_tags = soup.find_all("h1")
     row["h1_count"] = len(h1_tags)
-
     if not h1_tags:
         row["issues"].append("H1 отсутствует")
     else:
@@ -132,7 +166,8 @@ def _check_headings(soup, row: dict):
 _OG_REQUIRED = ("og:title", "og:description", "og:image")
 
 
-def _check_og(soup, row: dict):
+def _check_og(soup: "BeautifulSoup", row: dict) -> None:  # type: ignore[name-defined]
+    """Проверяет наличие обязательных Open Graph тегов."""
     og_data: dict[str, str] = {}
     for meta in soup.find_all("meta", attrs={"property": re.compile(r"^og:")}):
         prop = meta.get("property", "")
@@ -148,10 +183,10 @@ def _check_og(soup, row: dict):
 
 # ── JSON-LD ──────────────────────────────────────────────────────────────────
 
-def _check_jsonld(soup, row: dict):
+def _check_jsonld(soup: "BeautifulSoup", row: dict) -> None:  # type: ignore[name-defined]
+    """Проверяет наличие и валидность микроразметки JSON-LD."""
     scripts = soup.find_all("script", type="application/ld+json")
     row["jsonld_count"] = len(scripts)
-
     if not scripts:
         row["issues"].append("JSON-LD (Schema.org) не найден")
         return
@@ -168,12 +203,13 @@ def _check_jsonld(soup, row: dict):
                     if isinstance(item, dict):
                         row["jsonld_types"].append(item.get("@type", "?"))
         except (json.JSONDecodeError, TypeError) as exc:
-            row["issues"].append(f"JSON-LD #{i+1}: невалидный JSON ({exc})")
+            row["issues"].append(f"JSON-LD #{i + 1}: невалидный JSON ({exc})")
 
 
 # ── Вспомогательные ─────────────────────────────────────────────────────────
 
-def _meta(soup, name: str) -> str | None:
+def _meta(soup: "BeautifulSoup", name: str) -> str | None:  # type: ignore[name-defined]
+    """Извлекает содержимое meta-тега по имени."""
     tag = soup.find("meta", attrs={"name": name})
     if tag and tag.get("content") is not None:
         return tag["content"]
@@ -181,6 +217,7 @@ def _meta(soup, name: str) -> str | None:
 
 
 def _blank_row(url: str) -> dict:
+    """Создаёт пустую структуру результата проверки."""
     return {
         "check": CHECK_NAME,
         "url": url,
@@ -205,6 +242,7 @@ def _blank_row(url: str) -> dict:
 
 
 def check_many(pages: list[dict]) -> list[dict]:
+    """Массовая проверка списка страниц."""
     return [
         check(p["url"], resp=p.get("resp"), html=p.get("html"))
         for p in pages
@@ -212,10 +250,12 @@ def check_many(pages: list[dict]) -> list[dict]:
 
 
 def filter_with_issues(results: list[dict]) -> list[dict]:
+    """Фильтрует результаты, оставляя только страницы с проблемами."""
     return [r for r in results if r.get("issues")]
 
 
 def summary(results: list[dict]) -> str:
+    """Формирует текстовую сводку по результатам проверки."""
     total = len(results)
     with_issues = filter_with_issues(results)
     lines = [f"[{CHECK_NAME}] Проверено: {total}, с проблемами: {len(with_issues)}"]

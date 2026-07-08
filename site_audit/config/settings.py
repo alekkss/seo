@@ -1,15 +1,12 @@
 """
 Централизованная конфигурация приложения.
-
 Загружает переменные окружения из .env файла, выполняет ручную валидацию
 обязательных параметров и предоставляет доступ через dataclass Settings.
-
 Использование:
-    from site_audit.config.settings import get_settings
-    settings = get_settings()
-    print(settings.telegram_bot_token)
+from site_audit.config.settings import get_settings
+settings = get_settings()
+print(settings.telegram_bot_token)
 """
-
 from __future__ import annotations
 
 import os
@@ -33,7 +30,12 @@ class Settings:
     default_limit: int = 0
     default_workers: int = 10
     default_delay: float = 0.0
-    default_timeout: int = 15
+    
+    # Сетевые настройки (увеличены для устойчивости к медленным серверам)
+    default_timeout: int = 30
+    default_connect_timeout: int = 10
+    default_retries: int = 3
+    
     default_min_text_length: int = 100
     default_max_image_size_kb: int = 500
     default_check_external_links: bool = False
@@ -59,7 +61,6 @@ def _parse_allowed_user_ids(raw: str) -> list[int]:
     """Парсит строку с ID пользователей в список int."""
     if not raw or not raw.strip():
         return []
-
     result: list[int] = []
     for part in raw.split(","):
         part = part.strip()
@@ -125,7 +126,12 @@ def _load_settings() -> Settings:
     default_limit = int(os.getenv("DEFAULT_LIMIT", "0"))
     default_workers = int(os.getenv("DEFAULT_WORKERS", "10"))
     default_delay = float(os.getenv("DEFAULT_DELAY", "0.0"))
-    default_timeout = int(os.getenv("DEFAULT_TIMEOUT", "15"))
+    
+    # Сетевые настройки
+    default_timeout = int(os.getenv("DEFAULT_TIMEOUT", "30"))
+    default_connect_timeout = int(os.getenv("DEFAULT_CONNECT_TIMEOUT", "10"))
+    default_retries = int(os.getenv("DEFAULT_RETRIES", "3"))
+    
     default_min_text_length = int(os.getenv("DEFAULT_MIN_TEXT_LENGTH", "100"))
     default_max_image_size_kb = int(os.getenv("DEFAULT_MAX_IMAGE_SIZE_KB", "500"))
     default_check_external_links = _parse_bool(
@@ -149,6 +155,8 @@ def _load_settings() -> Settings:
     _validate_positive_int(default_limit, "DEFAULT_LIMIT")
     _validate_positive_int(default_workers, "DEFAULT_WORKERS")
     _validate_positive_int(default_timeout, "DEFAULT_TIMEOUT")
+    _validate_positive_int(default_connect_timeout, "DEFAULT_CONNECT_TIMEOUT")
+    _validate_positive_int(default_retries, "DEFAULT_RETRIES")
     _validate_positive_int(default_min_text_length, "DEFAULT_MIN_TEXT_LENGTH")
     _validate_positive_int(default_max_image_size_kb, "DEFAULT_MAX_IMAGE_SIZE_KB")
     _validate_positive_int(log_max_bytes, "LOG_MAX_BYTES")
@@ -159,10 +167,17 @@ def _load_settings() -> Settings:
         raise ValueError(
             "Переменная DEFAULT_WORKERS должна быть >= 1."
         )
-
     if default_delay < 0:
         raise ValueError(
             f"Переменная DEFAULT_DELAY не может быть отрицательной: {default_delay}"
+        )
+    if default_timeout < 5:
+        raise ValueError(
+            f"Переменная DEFAULT_TIMEOUT должна быть >= 5 секунд: {default_timeout}"
+        )
+    if default_retries < 0:
+        raise ValueError(
+            f"Переменная DEFAULT_RETRIES не может быть отрицательной: {default_retries}"
         )
 
     return Settings(
@@ -174,6 +189,8 @@ def _load_settings() -> Settings:
         default_workers=default_workers,
         default_delay=default_delay,
         default_timeout=default_timeout,
+        default_connect_timeout=default_connect_timeout,
+        default_retries=default_retries,
         default_min_text_length=default_min_text_length,
         default_max_image_size_kb=default_max_image_size_kb,
         default_check_external_links=default_check_external_links,
@@ -195,7 +212,6 @@ _settings_instance: Settings | None = None
 def get_settings(*, force_reload: bool = False) -> Settings:
     """
     Возвращает объект настроек (синглтон).
-
     При первом вызове загружает и валидирует конфигурацию.
     Последующие вызовы возвращают закэшированный экземпляр.
 
@@ -210,8 +226,6 @@ def get_settings(*, force_reload: bool = False) -> Settings:
                     или значения некорректны.
     """
     global _settings_instance  # noqa: PLW0603
-
     if _settings_instance is None or force_reload:
         _settings_instance = _load_settings()
-
     return _settings_instance

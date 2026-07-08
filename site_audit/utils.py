@@ -1,18 +1,16 @@
 """
 Общие утилиты: синхронный и асинхронный HTTP-клиенты, хелперы для URL и парсинга.
-
 Синхронные функции (fetch, head) используются для точечных запросов.
 Асинхронные функции (async_fetch, async_head) — для массовых операций
 (загрузка страниц, проверка ссылок, картинок, редиректов).
-
 Фабрика create_aiohttp_session() создаёт переиспользуемую сессию
 с ограничением параллельности через asyncio.Semaphore.
 """
-
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,39 +20,60 @@ import aiohttp
 import requests
 from bs4 import BeautifulSoup
 
+from .config.logger import get_logger
+
+logger = get_logger("utils.http")
+
 # ── Общие константы ──────────────────────────────────────────────────────────
 
 HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
 
 TAGS_TO_STRIP: list[str] = [
     "script", "style", "noscript", "nav", "header", "footer", "svg",
 ]
 
-# Таймауты по умолчанию для aiohttp (общий и на соединение)
-_DEFAULT_AIOHTTP_TIMEOUT_TOTAL: int = 60
-_DEFAULT_AIOHTTP_TIMEOUT_CONNECT: int = 10
-_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT: int = 10
-_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ: int = 45
+# ── Таймауты по умолчанию для aiohttp ────────────────────────────────────────
 
-# Максимальное количество одновременных соединений в пуле aiohttp
+_DEFAULT_AIOHTTP_TIMEOUT_TOTAL: int = 90
+_DEFAULT_AIOHTTP_TIMEOUT_CONNECT: int = 10
+_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT: int = 15
+_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ: int = 60
+
+# ── Пул соединений ───────────────────────────────────────────────────────────
+
 _DEFAULT_CONNECTOR_LIMIT: int = 100
 
-# Количество повторных попыток при сетевых ошибках и 5xx
-_DEFAULT_RETRIES: int = 2
+# ── Retry-стратегия ──────────────────────────────────────────────────────────
 
-# Базовая задержка между повторами (умножается на номер попытки)
-_DEFAULT_RETRY_DELAY: float = 1.0
+_DEFAULT_RETRIES: int = 3
+_DEFAULT_RETRY_DELAY: float = 1.5
+_MAX_RETRY_DELAY: float = 10.0
 
 # HTTP-коды, при которых выполняется повторная попытка
-_RETRY_STATUS_CODES: frozenset[int] = frozenset({500, 502, 503, 504, 429})
+_RETRY_STATUS_CODES: frozenset[int] = frozenset({
+    408,                    # Request Timeout
+    429,                    # Too Many Requests
+    500, 502, 503, 504,    # Server Errors
+    520, 521, 522, 523, 524, 525, 527,  # Cloudflare
+})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -65,7 +84,6 @@ _RETRY_STATUS_CODES: frozenset[int] = frozenset({500, 502, 503, 504, 429})
 class AsyncResponse:
     """
     Результат асинхронного HTTP-запроса.
-
     Обёртка над данными ответа, не зависящая от aiohttp.ClientResponse,
     чтобы можно было безопасно работать с результатом после закрытия сессии.
 
@@ -115,7 +133,6 @@ def create_aiohttp_session(
 ) -> aiohttp.ClientSession:
     """
     Создаёт aiohttp.ClientSession с настроенным пулом соединений.
-
     Пул ограничивает количество одновременных TCP-соединений,
     а семафор (передаётся отдельно в async_fetch) — количество
     одновременных запросов в рамках бизнес-логики.
@@ -133,15 +150,14 @@ def create_aiohttp_session(
         limit_per_host=30,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
+        force_close=False,
     )
-
     timeout = aiohttp.ClientTimeout(
         total=timeout_total,
         connect=timeout_connect,
         sock_connect=_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT,
         sock_read=_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ,
     )
-
     return aiohttp.ClientSession(
         connector=connector,
         timeout=timeout,
@@ -152,6 +168,25 @@ def create_aiohttp_session(
 # ═════════════════════════════════════════════════════════════════════════════
 # Асинхронный HTTP-клиент
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _compute_retry_delay(attempt: int, base_delay: float) -> float:
+    """
+    Вычисляет задержку перед повторной попыткой.
+    Использует экспоненциальный backoff с джиттером,
+    чтобы избежать thundering herd при массовых сбоях.
+
+    Args:
+        attempt: номер попытки (0-based).
+        base_delay: базовая задержка в секундах.
+
+    Returns:
+        Задержка в секундах с джиттером, не более _MAX_RETRY_DELAY.
+    """
+    exponential = base_delay * (2 ** attempt)
+    capped = min(exponential, _MAX_RETRY_DELAY)
+    jitter = random.uniform(0, capped * 0.3)
+    return capped + jitter
+
 
 async def async_fetch(
     url: str,
@@ -167,12 +202,9 @@ async def async_fetch(
 ) -> AsyncResponse:
     """
     Асинхронный HTTP-запрос с повторами и ограничением параллельности.
-
-    При 5xx и сетевых ошибках делает до retries повторных попыток
-    с экспоненциальным backoff (retry_delay * номер_попытки).
-
-    Семафор ограничивает количество одновременных запросов,
-    чтобы не перегружать целевой сервер.
+    При 5xx, 429 и сетевых ошибках делает до retries повторных попыток
+    с экспоненциальным backoff и джиттером.
+    Все ошибки логируются для диагностики.
 
     Args:
         url: адрес запроса.
@@ -188,11 +220,12 @@ async def async_fetch(
     Returns:
         AsyncResponse с данными ответа.
     """
+    # Формируем таймаут для этого запроса
     request_timeout: aiohttp.ClientTimeout | None = None
     if timeout is not None:
         request_timeout = aiohttp.ClientTimeout(
             total=timeout,
-            connect=min(timeout_connect, timeout) if (timeout_connect := _DEFAULT_AIOHTTP_TIMEOUT_CONNECT) else timeout,
+            connect=min(_DEFAULT_AIOHTTP_TIMEOUT_CONNECT, timeout),
             sock_connect=min(_DEFAULT_AIOHTTP_TIMEOUT_SOCK_CONNECT, timeout),
             sock_read=min(_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ, timeout),
         )
@@ -232,6 +265,17 @@ async def async_fetch(
 
                     is_ok = 200 <= resp.status < 400
 
+                    # Логируем неуспешные HTTP-статусы
+                    if not is_ok:
+                        logger.warning(
+                            "HTTP-ошибка",
+                            extra={"context": {
+                                "url": url,
+                                "status": resp.status,
+                                "attempt": attempt + 1,
+                            }},
+                        )
+
                     return AsyncResponse(
                         url=url,
                         status=resp.status,
@@ -243,25 +287,114 @@ async def async_fetch(
                         ok=is_ok,
                     )
 
+            # ── Обработка ошибок сети ────────────────────────────────────
             except asyncio.TimeoutError:
                 last_error = f"Таймаут запроса к {url}"
+                logger.warning(
+                    "Таймаут запроса",
+                    extra={"context": {
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "max_retries": retries,
+                    }},
+                )
+
+            except aiohttp.ServerDisconnectedError as exc:
+                last_error = f"Сервер разорвал соединение: {url} — {exc}"
+                logger.warning(
+                    "Сервер разорвал соединение",
+                    extra={"context": {
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                    }},
+                )
+
+            except aiohttp.ClientSSLError as exc:
+                last_error = f"Ошибка SSL при подключении к {url}: {exc}"
+                logger.error(
+                    "Ошибка SSL",
+                    extra={"context": {
+                        "url": url,
+                        "error": str(exc),
+                    }},
+                )
+                # SSL-ошибки обычно не временные — не повторяем
+                break
+
             except aiohttp.ClientConnectorError as exc:
                 last_error = f"Ошибка подключения к {url}: {exc}"
+                logger.warning(
+                    "Ошибка подключения",
+                    extra={"context": {
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                    }},
+                )
+
+            except aiohttp.ClientPayloadError as exc:
+                last_error = f"Ошибка чтения ответа от {url}: {exc}"
+                logger.warning(
+                    "Ошибка чтения ответа",
+                    extra={"context": {
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                    }},
+                )
+
             except aiohttp.ClientError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "Ошибка aiohttp",
+                    extra={"context": {
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }},
+                )
+
             except OSError as exc:
                 last_error = f"Ошибка сети: {exc}"
+                logger.warning(
+                    "Ошибка сети (OSError)",
+                    extra={"context": {
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                    }},
+                )
 
-            # Повтор при ошибке или 5xx/429
+            # ── Решение о повторе ────────────────────────────────────────
             if attempt < retries:
                 should_retry = bool(last_error) or last_status in _RETRY_STATUS_CODES
                 if should_retry:
-                    wait_time = retry_delay * (attempt + 1)
+                    wait_time = _compute_retry_delay(attempt, retry_delay)
+                    logger.debug(
+                        "Повторная попытка",
+                        extra={"context": {
+                            "url": url,
+                            "next_attempt": attempt + 2,
+                            "wait_seconds": round(wait_time, 2),
+                        }},
+                    )
                     await asyncio.sleep(wait_time)
                 else:
                     break
 
-        # Все попытки исчерпаны — возвращаем объект с ошибкой
+        # Все попытки исчерпаны — логируем финальную ошибку
+        if last_error:
+            logger.error(
+                "Все попытки исчерпаны",
+                extra={"context": {
+                    "url": url,
+                    "attempts": retries + 1,
+                    "last_error": last_error,
+                }},
+            )
+
         return AsyncResponse(
             url=url,
             status=last_status,
@@ -287,7 +420,6 @@ async def async_head(
 ) -> AsyncResponse:
     """
     Асинхронный HEAD-запрос.
-
     Если сервер возвращает 405/501 (HEAD не поддерживается),
     автоматически выполняет GET-запрос.
 
@@ -345,13 +477,10 @@ async def async_fetch_many(
 ) -> list[AsyncResponse]:
     """
     Массовая загрузка URL с ограничением параллельности и прогрессом.
-
     Это основная рабочая лошадка для этапа загрузки страниц.
     Все запросы выполняются конкурентно через asyncio.gather,
     а семафор ограничивает количество одновременных соединений.
-
     CRITICAL: return_exceptions=True — чтобы один таймаут не ломал весь батч.
-    Если задача падает с исключением, она оборачивается в AsyncResponse с ошибкой.
 
     Args:
         urls: список URL для загрузки.
@@ -372,10 +501,8 @@ async def async_fetch_many(
 
     async def _fetch_one(url: str) -> AsyncResponse:
         nonlocal done_count
-
         if delay > 0:
             await asyncio.sleep(delay)
-
         try:
             resp = await async_fetch(
                 url,
@@ -385,8 +512,15 @@ async def async_fetch_many(
                 retries=retries,
             )
         except Exception as exc:
-            # Защита от неожиданных исключений (не должно происходить,
-            # но если что-то пролетело мимо — не ломаем весь батч)
+            # Защита от неожиданных исключений
+            logger.error(
+                "Неожиданная ошибка в async_fetch_many",
+                extra={"context": {
+                    "url": url,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }},
+            )
             resp = AsyncResponse(
                 url=url,
                 error=f"Неожиданная ошибка: {type(exc).__name__}: {exc}",
@@ -409,6 +543,14 @@ async def async_fetch_many(
         if isinstance(result, AsyncResponse):
             final_results.append(result)
         elif isinstance(result, Exception):
+            logger.error(
+                "Исключение из gather",
+                extra={"context": {
+                    "url": url,
+                    "error_type": type(result).__name__,
+                    "error": str(result),
+                }},
+            )
             final_results.append(AsyncResponse(
                 url=url,
                 error=f"Ошибка задачи: {type(result).__name__}: {result}",
@@ -431,8 +573,8 @@ async def async_fetch_many(
 def fetch(
     url: str,
     *,
-    timeout: int = 15,
-    retries: int = 2,
+    timeout: int = 30,
+    retries: int = 3,
     retry_delay: float = 2.0,
     method: str = "GET",
     allow_redirects: bool = True,
@@ -440,8 +582,9 @@ def fetch(
 ) -> requests.Response | Exception:
     """
     Синхронный GET/HEAD-запрос с повторами при сетевых ошибках и 5xx.
-
     Используется для точечных запросов вне массовых операций.
+    Все ошибки логируются для диагностики.
+
     Для массовых операций используйте async_fetch / async_fetch_many.
 
     Args:
@@ -468,12 +611,82 @@ def fetch(
                 allow_redirects=allow_redirects,
             )
             last = resp
+
             if resp.status_code < 500:
                 return resp
-        except requests.RequestException as exc:
+
+            # 5xx — логируем и повторяем
+            logger.warning(
+                "HTTP-ошибка (sync)",
+                extra={"context": {
+                    "url": url,
+                    "status": resp.status_code,
+                    "attempt": attempt + 1,
+                }},
+            )
+
+        except requests.exceptions.SSLError as exc:
             last = exc
+            logger.error(
+                "SSL-ошибка (sync)",
+                extra={"context": {
+                    "url": url,
+                    "error": str(exc),
+                }},
+            )
+            # SSL-ошибки обычно не временные — не повторяем
+            break
+
+        except requests.exceptions.Timeout as exc:
+            last = exc
+            logger.warning(
+                "Таймаут (sync)",
+                extra={"context": {
+                    "url": url,
+                    "attempt": attempt + 1,
+                    "timeout": timeout,
+                }},
+            )
+
+        except requests.exceptions.ConnectionError as exc:
+            last = exc
+            logger.warning(
+                "Ошибка подключения (sync)",
+                extra={"context": {
+                    "url": url,
+                    "attempt": attempt + 1,
+                    "error": str(exc),
+                }},
+            )
+
+        except requests.exceptions.RequestException as exc:
+            last = exc
+            logger.warning(
+                "Ошибка requests (sync)",
+                extra={"context": {
+                    "url": url,
+                    "attempt": attempt + 1,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }},
+            )
+
+        # Задержка перед повтором
         if attempt < retries:
-            time.sleep(retry_delay * (attempt + 1))
+            wait_time = retry_delay * (attempt + 1)
+            time.sleep(wait_time)
+
+    # Все попытки исчерпаны
+    if last is not None and isinstance(last, Exception):
+        logger.error(
+            "Все попытки исчерпаны (sync)",
+            extra={"context": {
+                "url": url,
+                "attempts": retries + 1,
+                "error_type": type(last).__name__,
+                "error": str(last),
+            }},
+        )
 
     return last  # type: ignore[return-value]
 
@@ -554,7 +767,6 @@ def text_hash(text: str) -> str:
 def is_html_response(resp: requests.Response | AsyncResponse) -> bool:
     """
     Проверяет, содержит ли ответ HTML.
-
     Работает и с requests.Response, и с AsyncResponse.
     """
     if isinstance(resp, AsyncResponse):
