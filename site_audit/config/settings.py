@@ -3,9 +3,9 @@
 Загружает переменные окружения из .env файла, выполняет ручную валидацию
 обязательных параметров и предоставляет доступ через dataclass Settings.
 Использование:
-from site_audit.config.settings import get_settings
-settings = get_settings()
-print(settings.telegram_bot_token)
+    from site_audit.config.settings import get_settings
+    settings = get_settings()
+    print(settings.telegram_bot_token)
 """
 from __future__ import annotations
 
@@ -24,18 +24,25 @@ class Settings:
     telegram_bot_token: str
     allowed_user_ids: list[int] = field(default_factory=list)
 
+    # ── Прокси ────────────────────────────────────────────────
+    proxy_enabled: bool = False
+    proxy_file_path: str = "./proxies.txt"
+    proxy_cooldown: float = 120.0
+    proxy_max_fails: int = 3
+    proxy_max_connections: int = 5
+
     # ── Параметры аудита ──────────────────────────────────────
     default_max_crawl_pages: int = 500
     default_max_depth: int = 3
     default_limit: int = 0
     default_workers: int = 10
     default_delay: float = 0.0
-    
+
     # Сетевые настройки (увеличены для устойчивости к медленным серверам)
     default_timeout: int = 30
     default_connect_timeout: int = 10
     default_retries: int = 3
-    
+
     default_min_text_length: int = 100
     default_max_image_size_kb: int = 500
     default_check_external_links: bool = False
@@ -120,18 +127,25 @@ def _load_settings() -> Settings:
         os.getenv("ALLOWED_USER_IDS", "")
     )
 
+    # ── Прокси ────────────────────────────────────────────────
+    proxy_enabled = _parse_bool(os.getenv("PROXY_ENABLED", "false"))
+    proxy_file_path = os.getenv("PROXY_FILE_PATH", "./proxies.txt").strip()
+    proxy_cooldown = float(os.getenv("PROXY_COOLDOWN", "120"))
+    proxy_max_fails = int(os.getenv("PROXY_MAX_FAILS", "3"))
+    proxy_max_connections = int(os.getenv("PROXY_MAX_CONNECTIONS", "5"))
+
     # ── Параметры аудита ──────────────────────────────────────
     default_max_crawl_pages = int(os.getenv("DEFAULT_MAX_CRAWL_PAGES", "500"))
     default_max_depth = int(os.getenv("DEFAULT_MAX_DEPTH", "3"))
     default_limit = int(os.getenv("DEFAULT_LIMIT", "0"))
     default_workers = int(os.getenv("DEFAULT_WORKERS", "10"))
     default_delay = float(os.getenv("DEFAULT_DELAY", "0.0"))
-    
+
     # Сетевые настройки
     default_timeout = int(os.getenv("DEFAULT_TIMEOUT", "30"))
     default_connect_timeout = int(os.getenv("DEFAULT_CONNECT_TIMEOUT", "10"))
     default_retries = int(os.getenv("DEFAULT_RETRIES", "3"))
-    
+
     default_min_text_length = int(os.getenv("DEFAULT_MIN_TEXT_LENGTH", "100"))
     default_max_image_size_kb = int(os.getenv("DEFAULT_MAX_IMAGE_SIZE_KB", "500"))
     default_check_external_links = _parse_bool(
@@ -180,9 +194,33 @@ def _load_settings() -> Settings:
             f"Переменная DEFAULT_RETRIES не может быть отрицательной: {default_retries}"
         )
 
+    # Валидация прокси
+    if proxy_cooldown < 0:
+        raise ValueError(
+            f"Переменная PROXY_COOLDOWN не может быть отрицательной: {proxy_cooldown}"
+        )
+    if proxy_enabled and not proxy_file_path:
+        raise ValueError(
+            "PROXY_ENABLED=true, но PROXY_FILE_PATH не указан. "
+            "Укажите путь к файлу со списком прокси."
+        )
+    if proxy_max_fails < 1:
+        raise ValueError(
+            f"Переменная PROXY_MAX_FAILS должна быть >= 1: {proxy_max_fails}"
+        )
+    if proxy_max_connections < 1:
+        raise ValueError(
+            f"Переменная PROXY_MAX_CONNECTIONS должна быть >= 1: {proxy_max_connections}"
+        )
+
     return Settings(
         telegram_bot_token=telegram_bot_token,
         allowed_user_ids=allowed_user_ids,
+        proxy_enabled=proxy_enabled,
+        proxy_file_path=proxy_file_path,
+        proxy_cooldown=proxy_cooldown,
+        proxy_max_fails=proxy_max_fails,
+        proxy_max_connections=proxy_max_connections,
         default_max_crawl_pages=default_max_crawl_pages,
         default_max_depth=default_max_depth,
         default_limit=default_limit,

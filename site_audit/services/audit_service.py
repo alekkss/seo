@@ -4,15 +4,19 @@
 Используется как единая точка входа для CLI и Telegram-бота.
 Основной метод — run_audit_async (асинхронный).
 Синхронная обёртка run_audit сохранена для обратной совместимости.
+
 Использование:
-from site_audit.services import AuditService
-from site_audit.config import get_settings
-settings = get_settings()
-service = AuditService(settings)
-# Асинхронный вызов
-result = await service.run_audit_async(params)
-# Синхронный вызов (обёртка над asyncio.run)
-result = service.run_audit(params)
+    from site_audit.services import AuditService
+    from site_audit.config import get_settings
+
+    settings = get_settings()
+    service = AuditService(settings)
+
+    # Асинхронный вызов
+    result = await service.run_audit_async(params)
+
+    # Синхронный вызов (обёртка над asyncio.run)
+    result = service.run_audit(params)
 """
 from __future__ import annotations
 
@@ -33,7 +37,8 @@ from site_audit.checks import (
 )
 from site_audit.config.logger import get_logger, set_trace_id
 from site_audit.config.settings import Settings
-from site_audit.crawler import async_crawl, async_try_sitemap
+from site_audit.crawler import async_crawl, async_try_sitemap, create_proxy_rotator
+from site_audit.proxy import ProxyRotator
 from site_audit.report import save_all
 from site_audit.utils import (
     AsyncResponse,
@@ -87,11 +92,11 @@ class AuditParams:
     limit: int = 0
     workers: int = 10
     delay: float = 0.0
-    
+
     # Сетевые настройки (увеличены для устойчивости к медленным серверам)
     timeout: int = 30
     retries: int = 3
-    
+
     min_text_length: int = 100
     max_image_size_kb: int = 500
     check_external_links: bool = False
@@ -118,13 +123,21 @@ class AuditService:
     """
     Сервис выполнения полного цикла аудита сайта.
     Принимает настройки через конструктор (Dependency Injection),
-     не зависит от конкретной точки входа (CLI/бот).
-     Основной метод — run_audit_async (асинхронный).
-     Метод run_audit — синхронная обёртка для удобства вызова.
+    не зависит от конкретной точки входа (CLI/бот).
+    При инициализации создаёт ProxyRotator из настроек —
+    один ротатор переиспользуется для всех запросов аудита.
+    Основной метод — run_audit_async (асинхронный).
+    Метод run_audit — синхронная обёртка для удобства вызова.
     """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._proxy_rotator: ProxyRotator | None = create_proxy_rotator()
+
+    @property
+    def proxy_rotator(self) -> ProxyRotator | None:
+        """Возвращает текущий ротатор прокси (для диагностики)."""
+        return self._proxy_rotator
 
     @staticmethod
     def available_checks() -> dict[str, str]:
@@ -239,12 +252,28 @@ class AuditService:
         if not base_url.startswith("http"):
             base_url = "https://" + base_url
 
-        logger.info(
-            "Аудит запущен",
-            extra={"context": {"url": base_url, "trace_id": trace_id}},
-        )
-
-        self._notify(on_progress, f"🔍 Начинаю аудит: {base_url}")
+        # Логируем информацию о прокси при старте аудита
+        if self._proxy_rotator is not None and self._proxy_rotator.is_enabled:
+            logger.info(
+                "Аудит запущен с прокси",
+                extra={"context": {
+                    "url": base_url,
+                    "trace_id": trace_id,
+                    "proxy_count": self._proxy_rotator.total,
+                    "proxy_healthy": self._proxy_rotator.healthy_count,
+                }},
+            )
+            self._notify(
+                on_progress,
+                f"🔍 Начинаю аудит: {base_url} "
+                f"(прокси: {self._proxy_rotator.total} шт.)",
+            )
+        else:
+            logger.info(
+                "Аудит запущен без прокси",
+                extra={"context": {"url": base_url, "trace_id": trace_id}},
+            )
+            self._notify(on_progress, f"🔍 Начинаю аудит: {base_url}")
 
         # ── 1. Сбор URL ──────────────────────────────────────────
         self._notify(on_progress, "📋 Этап 1/4: Сбор URL...")
@@ -327,13 +356,14 @@ class AuditService:
     # Этап 1: Сбор URL (async)
     # ═════════════════════════════════════════════════════════════════════
 
-    @staticmethod
     async def _collect_urls_async(
+        self,
         base_url: str,
         params: AuditParams,
     ) -> list[str]:
         """
         Асинхронно собирает URL через sitemap или BFS-обход.
+        Передаёт ProxyRotator для выполнения запросов через прокси.
 
         Args:
             base_url: корневой URL сайта.
@@ -346,6 +376,7 @@ class AuditService:
             base_url,
             timeout=params.timeout,
             retries=params.retries,
+            proxy_rotator=self._proxy_rotator,
             verbose=False,
         )
         if urls_set:
@@ -364,6 +395,7 @@ class AuditService:
                 timeout=params.timeout,
                 retries=params.retries,
                 delay=params.delay,
+                proxy_rotator=self._proxy_rotator,
                 verbose=False,
             )
 
@@ -376,8 +408,8 @@ class AuditService:
     # Этап 2: Загрузка страниц (async)
     # ═════════════════════════════════════════════════════════════════════
 
-    @staticmethod
     async def _download_pages_async(
+        self,
         urls: list[str],
         params: AuditParams,
         on_progress: Callable[[str], None] | None = None,
@@ -386,6 +418,7 @@ class AuditService:
         Асинхронно загружает HTML всех URL через aiohttp.
         Использует семафор для ограничения количества одновременных запросов.
         Переиспользует одну TCP-сессию для всех запросов.
+        Передаёт ProxyRotator для выполнения запросов через прокси.
 
         Args:
             urls: список URL для загрузки.
@@ -408,6 +441,7 @@ class AuditService:
                 urls,
                 session=session,
                 semaphore=semaphore,
+                proxy_rotator=self._proxy_rotator,
                 timeout=params.timeout,
                 retries=params.retries,
                 delay=params.delay,

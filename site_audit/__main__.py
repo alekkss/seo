@@ -5,6 +5,7 @@ CLI-оркестратор аудита сайта.
     python -m site_audit https://example.com
     python -m site_audit https://example.com --checks seo,empty_pages --limit 50
     python -m site_audit https://example.com --workers 20 --output-dir ./reports
+    python -m site_audit https://example.com --no-proxy
 """
 
 from __future__ import annotations
@@ -45,6 +46,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-text-length", type=int, default=None)
     p.add_argument("--max-image-size-kb", type=int, default=None)
     p.add_argument("--check-external-links", action="store_true", default=None)
+
+    p.add_argument("--no-proxy", action="store_true", default=False,
+                   help="Отключить прокси для этого запуска (игнорирует PROXY_ENABLED)")
 
     p.add_argument("--output-dir", default=None)
     p.add_argument("--excel-name", default=None)
@@ -145,8 +149,19 @@ def main(argv: list[str] | None = None) -> None:
 
     service = AuditService(settings)
 
+    # Принудительное отключение прокси через --no-proxy
+    if args.no_proxy and service.proxy_rotator is not None:
+        service._proxy_rotator = None  # noqa: SLF001
+        if verbose:
+            print("  ⚠️  Прокси отключены флагом --no-proxy")
+
     print(f"\n{'='*60}")
     print(f"  АУДИТ САЙТА: {params.base_url}")
+    if service.proxy_rotator is not None and service.proxy_rotator.is_enabled:
+        rotator = service.proxy_rotator
+        print(f"  Прокси: {rotator.total} шт. (активных: {rotator.healthy_count})")
+    else:
+        print("  Прокси: отключены")
     print(f"{'='*60}\n")
 
     try:

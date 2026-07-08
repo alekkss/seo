@@ -1,21 +1,24 @@
 """
 Краулер: сбор URL через sitemap.xml и/или асинхронный обход по внутренним ссылкам.
 Асинхронные функции:
-async_try_sitemap — парсит sitemap.xml / sitemap_index.xml
-async_crawl — BFS-обход сайта по внутренним ссылкам
+    async_try_sitemap — парсит sitemap.xml / sitemap_index.xml
+    async_crawl — BFS-обход сайта по внутренним ссылкам
 Синхронные функции (только парсинг HTML, без сети):
-extract_links — извлекает внутренние и внешние ссылки со страницы
-extract_images — извлекает изображения со страницы
+    extract_links — извлекает внутренние и внешние ссылки со страницы
+    extract_images — извлекает изображения со страницы
+Фабрика:
+    create_proxy_rotator — создаёт ProxyRotator из настроек приложения
 """
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 from .config.logger import get_logger
 from .config.settings import get_settings
+from .proxy import ProxyRotator
 from .utils import (
     AsyncResponse,
     async_fetch,
@@ -26,6 +29,9 @@ from .utils import (
     make_absolute,
     parse_html,
 )
+
+if TYPE_CHECKING:
+    import aiohttp
 
 logger = get_logger("crawler")
 
@@ -47,6 +53,42 @@ _MAX_SITEMAP_DEPTH: int = 3
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Фабрика ProxyRotator
+# ═════════════════════════════════════════════════════════════════════════════
+
+def create_proxy_rotator() -> ProxyRotator | None:
+    """
+    Создаёт ProxyRotator из настроек приложения.
+    Единая точка инициализации для CLI, бота и библиотечного использования.
+    Если прокси отключены в настройках — возвращает None.
+
+    Returns:
+        Настроенный ProxyRotator или None, если прокси отключены.
+    """
+    settings = get_settings()
+
+    if not settings.proxy_enabled:
+        logger.info("Прокси отключены в настройках (PROXY_ENABLED=false)")
+        return None
+
+    rotator = ProxyRotator.from_file(
+        settings.proxy_file_path,
+        cooldown=settings.proxy_cooldown,
+        max_fails=settings.proxy_max_fails,
+        max_connections=settings.proxy_max_connections,
+    )
+
+    if not rotator.is_enabled:
+        logger.warning(
+            "Прокси включены в настройках, но файл пуст или не найден",
+            extra={"context": {"path": settings.proxy_file_path}},
+        )
+        return None
+
+    return rotator
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Асинхронный Sitemap
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -55,6 +97,7 @@ async def async_try_sitemap(
     *,
     timeout: int | None = None,
     retries: int | None = None,
+    proxy_rotator: ProxyRotator | None = None,
     verbose: bool = True,
 ) -> set[str]:
     """
@@ -67,6 +110,7 @@ async def async_try_sitemap(
         base_url: корневой URL сайта.
         timeout: таймаут HTTP-запросов в секундах (None — из настроек).
         retries: количество повторов при ошибках (None — из настроек).
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
@@ -96,6 +140,7 @@ async def async_try_sitemap(
                 visited=visited_sitemaps,
                 timeout=_timeout,
                 retries=_retries,
+                proxy_rotator=proxy_rotator,
                 depth=0,
             )
             if urls:
@@ -115,11 +160,12 @@ async def async_try_sitemap(
 async def _parse_sitemap(
     xml_url: str,
     *,
-    session: "aiohttp.ClientSession",  # type: ignore[name-defined]
+    session: aiohttp.ClientSession,
     urls: set[str],
     visited: set[str],
     timeout: int,
     retries: int,
+    proxy_rotator: ProxyRotator | None,
     depth: int,
 ) -> None:
     """
@@ -135,6 +181,7 @@ async def _parse_sitemap(
         visited: множество уже обработанных sitemap-URL.
         timeout: таймаут запроса.
         retries: количество повторов.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         depth: текущая глубина рекурсии.
     """
     if depth > _MAX_SITEMAP_DEPTH or xml_url in visited:
@@ -147,6 +194,7 @@ async def _parse_sitemap(
         timeout=timeout,
         retries=retries,
         retry_delay=1.5,
+        proxy_rotator=proxy_rotator,
     )
 
     if not resp.ok or resp.status != 200:
@@ -187,6 +235,7 @@ async def _parse_sitemap(
                         visited=visited,
                         timeout=timeout,
                         retries=retries,
+                        proxy_rotator=proxy_rotator,
                         depth=depth + 1,
                     )
                 )
@@ -223,6 +272,7 @@ async def async_crawl(
     timeout: int | None = None,
     retries: int | None = None,
     delay: float = 0.0,
+    proxy_rotator: ProxyRotator | None = None,
     verbose: bool = True,
 ) -> list[str]:
     """
@@ -241,6 +291,7 @@ async def async_crawl(
         timeout: таймаут HTTP-запросов в секундах (None — из настроек).
         retries: количество повторов при ошибках (None — из настроек).
         delay: задержка между запросами (для защиты от бана).
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
@@ -275,6 +326,7 @@ async def async_crawl(
                 timeout=_timeout,
                 retries=_retries,
                 delay=delay,
+                proxy_rotator=proxy_rotator,
             )
 
             next_layer: list[str] = []
@@ -340,11 +392,12 @@ async def async_crawl(
 async def _fetch_layer(
     urls: list[str],
     *,
-    session: "aiohttp.ClientSession",  # type: ignore[name-defined]
+    session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
     timeout: int,
     retries: int,
     delay: float,
+    proxy_rotator: ProxyRotator | None = None,
 ) -> list[AsyncResponse]:
     """
     Загружает все URL одного уровня глубины параллельно.
@@ -359,6 +412,7 @@ async def _fetch_layer(
         timeout: таймаут запроса.
         retries: количество повторов.
         delay: задержка между запросами.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
 
     Returns:
         Список AsyncResponse для каждого URL.
@@ -374,6 +428,7 @@ async def _fetch_layer(
                 timeout=timeout,
                 retries=retries,
                 retry_delay=1.5,
+                proxy_rotator=proxy_rotator,
             )
         except Exception as exc:
             # Защита от неожиданных исключений — оборачиваем в AsyncResponse
