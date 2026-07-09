@@ -439,6 +439,19 @@ for r in seo.filter_with_issues(seo_results):
 
 ---
 
+### VPS
+
+- перечитать конфигурацию systemd
+systemctl daemon-reload
+
+- включить автозапуск при загрузке И сразу запустить
+systemctl enable --now seo-bot.service
+
+- проверить, что служба работает (Active: active (running))
+systemctl status seo-bot.service
+
+- смотреть живые логи бота
+journalctl -u seo-bot.service -f
 
 ---
 
