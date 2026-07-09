@@ -20,6 +20,11 @@
 | **Редиректы** | Цепочки из 2+ хопов, циклические редиректы, редиректы на внешние домены, HTTPS→HTTP даунгрейд |
 | **Дубликаты** | Одинаковые Title, Description, H1 на разных URL, полные и частичные дубли контента, общий canonical |
 | **Заглушки** | Lorem ipsum, TODO/FIXME в тексте и HTML-комментариях, типичные русские и английские заглушки |
+| **robots.txt и Sitemap** | Наличие и валидность robots.txt, блокировка важных путей, директива Sitemap, URL из sitemap с ошибками или noindex |
+| **Mixed Content** | HTTP-ресурсы (скрипты, стили, картинки, iframe) на HTTPS-страницах — активный и пассивный |
+| **Страницы-сироты** | Страницы без входящих внутренних ссылок — невидимы для пользователей и плохо ранжируются |
+| **Качество мета-тегов** | Длина title (<30 или >60 символов), длина description (<70 или >160), keyword stuffing, совпадение title и description |
+| **Структура заголовков** | Множественные H1, пропущенные уровни (H1→H3 без H2), пустые и слишком длинные заголовки |
 
 ---
 
@@ -86,13 +91,18 @@ PROXY_FILE_PATH=./proxies.txt
     │   └── states.py        # Состояние сессий пользователей
     └── checks/
         ├── __init__.py
-        ├── empty_pages.py   # Пустые страницы
-        ├── seo.py           # SEO-проверки
-        ├── broken_links.py  # Битые ссылки
-        ├── images.py        # Картинки
-        ├── redirects.py     # Редиректы
-        ├── duplicates.py    # Дубликаты
-        └── placeholders.py  # Заглушки
+        ├── empty_pages.py       # Пустые страницы
+        ├── seo.py               # SEO-проверки
+        ├── broken_links.py      # Битые ссылки
+        ├── images.py            # Картинки
+        ├── redirects.py         # Редиректы
+        ├── duplicates.py        # Дубликаты
+        ├── placeholders.py      # Заглушки
+        ├── robots_sitemap.py    # robots.txt и валидация sitemap
+        ├── mixed_content.py     # HTTP-ресурсы на HTTPS-страницах
+        ├── orphan_pages.py      # Страницы-сироты
+        ├── meta_quality.py      # Качество title и description
+        └── heading_structure.py # Структура заголовков H1–H6
 ```
 
 > **Важно:** запускать нужно из родительской папки, а не изнутри `site_audit/`.
@@ -116,7 +126,7 @@ python -m site_audit https://example.com --limit 50
 ### Выбрать конкретные проверки
 
 ```bash
-python -m site_audit https://example.com --checks seo,empty_pages,broken_links
+python -m site_audit https://example.com --checks seo,empty_pages,broken_links,meta_quality,heading_structure
 ```
 
 ### Проверить также внешние ссылки
@@ -289,7 +299,9 @@ ALLOWED_USER_IDS=123456789,987654321
 3. Проверки
    ├── Каждая проверка получает уже скачанные страницы
    ├── Не делает повторных запросов к уже загруженным URL
-   └── Дополнительные запросы (картинки, ссылки, редиректы) — асинхронные
+   ├── CPU-bound проверки (SEO, дубликаты, заглушки, mixed content,
+   │   мета-теги, заголовки, сироты) — работают с HTML в памяти
+   └── IO-bound проверки (картинки, ссылки, редиректы, robots.txt) — асинхронные
        └── Используют тот же прокси-пул и таймаут, что и загрузка страниц
 
 4. Отчёты
@@ -314,6 +326,15 @@ python -m site_audit https://mysite.ru \
     --delay 1.0 \
     --timeout 30
 ```
+
+### CLI: только новые проверки (robots, mixed content, мета-теги, заголовки, сироты)
+
+```bash
+python -m site_audit https://mysite.ru \
+    --checks robots_sitemap,mixed_content,meta_quality,heading_structure,orphan_pages \
+    --limit 100
+```
+
 ### CLI: аудит через прокси (для сайтов с блокировкой по IP)
 
 Убедитесь, что в `.env` указано `PROXY_ENABLED=true` и файл `proxies.txt` заполнен.

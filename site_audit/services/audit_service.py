@@ -31,8 +31,13 @@ from site_audit.checks import (
     broken_links,
     duplicates,
     empty_pages,
+    heading_structure,
     images,
+    meta_quality,
+    mixed_content,
+    orphan_pages,
     placeholders,
+    robots_sitemap,
     seo,
 )
 from site_audit.config.logger import get_logger, set_trace_id
@@ -53,7 +58,11 @@ logger = get_logger("service.audit")
 # ── Проверки, которые выполняют свои HTTP-запросы (IO-bound, async) ────────
 # Эти проверки имеют async_check() и должны вызываться напрямую через await
 # в текущем event loop, чтобы семафоры прокси работали корректно.
-_ASYNC_IO_CHECKS: frozenset[str] = frozenset({"broken_links", "images"})
+_ASYNC_IO_CHECKS: frozenset[str] = frozenset({
+    "broken_links",
+    "images",
+    "robots_sitemap",
+})
 
 
 # ── Реестр проверок ───────────────────────────────────────────
@@ -82,6 +91,26 @@ ALL_CHECKS: dict[str, dict[str, Any]] = {
     "placeholders": {
         "module": placeholders,
         "description": placeholders.DESCRIPTION,
+    },
+    "robots_sitemap": {
+        "module": robots_sitemap,
+        "description": robots_sitemap.DESCRIPTION,
+    },
+    "mixed_content": {
+        "module": mixed_content,
+        "description": mixed_content.DESCRIPTION,
+    },
+    "orphan_pages": {
+        "module": orphan_pages,
+        "description": orphan_pages.DESCRIPTION,
+    },
+    "meta_quality": {
+        "module": meta_quality,
+        "description": meta_quality.DESCRIPTION,
+    },
+    "heading_structure": {
+        "module": heading_structure,
+        "description": heading_structure.DESCRIPTION,
     },
 }
 
@@ -131,13 +160,14 @@ class AuditService:
     не зависит от конкретной точки входа (CLI/бот).
     При инициализации создаёт ProxyRotator из настроек —
     один ротатор переиспользуется для всех запросов аудита,
-    включая проверки битых ссылок и картинок.
+    включая проверки битых ссылок, картинок и robots.txt.
 
-    IO-bound проверки (broken_links, images) выполняются напрямую
-    через await в текущем event loop, чтобы семафоры прокси
+    IO-bound проверки (broken_links, images, robots_sitemap) выполняются
+    напрямую через await в текущем event loop, чтобы семафоры прокси
     работали корректно (без конфликтов между разными loop'ами).
 
-    CPU-bound проверки (seo, empty_pages, duplicates, placeholders)
+    CPU-bound проверки (seo, empty_pages, duplicates, placeholders,
+    mixed_content, meta_quality, heading_structure, orphan_pages)
     выполняются в ThreadPoolExecutor через run_in_executor.
 
     Основной метод — run_audit_async (асинхронный).
@@ -147,6 +177,8 @@ class AuditService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._proxy_rotator: ProxyRotator | None = create_proxy_rotator()
+        # Сохраняется после сбора URL для использования в orphan_pages и robots_sitemap
+        self._sitemap_urls: set[str] | None = None
 
     @property
     def proxy_rotator(self) -> ProxyRotator | None:
@@ -301,7 +333,10 @@ class AuditService:
         self._notify(on_progress, f"📋 Найдено URL: {len(urls)}")
         logger.info(
             "URL собраны",
-            extra={"context": {"count": len(urls)}},
+            extra={"context": {
+                "count": len(urls),
+                "sitemap_urls": len(self._sitemap_urls) if self._sitemap_urls else 0,
+            }},
         )
 
         # ── 2. Загрузка страниц ──────────────────────────────────
@@ -378,6 +413,8 @@ class AuditService:
         """
         Асинхронно собирает URL через sitemap или BFS-обход.
         Передаёт ProxyRotator для выполнения запросов через прокси.
+        Сохраняет полный набор URL из sitemap в self._sitemap_urls
+        до применения limit — для использования в orphan_pages и robots_sitemap.
 
         Args:
             base_url: корневой URL сайта.
@@ -393,13 +430,18 @@ class AuditService:
             proxy_rotator=self._proxy_rotator,
             verbose=False,
         )
+
         if urls_set:
+            # Сохраняем полный набор URL из sitemap до применения limit
+            self._sitemap_urls = set(urls_set)
             logger.info(
                 "URL получены из sitemap",
                 extra={"context": {"count": len(urls_set)}},
             )
             urls = list(urls_set)
         else:
+            # BFS-обход: sitemap отсутствует
+            self._sitemap_urls = None
             logger.info("Sitemap не найден, запускаю BFS-обход")
             urls = await async_crawl(
                 base_url,
@@ -498,12 +540,11 @@ class AuditService:
         Выполняет выбранные проверки над загруженными страницами.
 
         Два режима выполнения:
-          - IO-bound проверки (broken_links, images) — вызываются напрямую
-            через await в текущем event loop, чтобы семафоры прокси
-            из ProxyRotator работали корректно (все в одном loop).
-          - CPU-bound проверки (seo, empty_pages, duplicates, placeholders) —
-            запускаются в ThreadPoolExecutor через run_in_executor,
-            чтобы не блокировать event loop.
+          - IO-bound проверки (broken_links, images, robots_sitemap) —
+            вызываются напрямую через await в текущем event loop,
+            чтобы семафоры прокси из ProxyRotator работали корректно.
+          - CPU-bound проверки (остальные) — запускаются в
+            ThreadPoolExecutor через run_in_executor.
 
         Args:
             base_url: корневой URL сайта.
@@ -548,7 +589,8 @@ class AuditService:
                     # IO-bound: вызываем async_check напрямую в текущем loop,
                     # чтобы семафоры прокси работали в одном event loop
                     res = await self._execute_async_check(
-                        name, mod, compatible_pages, params, check_workers,
+                        name, mod, compatible_pages, params,
+                        check_workers, base_url,
                     )
                 else:
                     # CPU-bound: выносим в executor, чтобы не блокировать loop
@@ -556,7 +598,8 @@ class AuditService:
                         None,
                         partial(
                             self._execute_sync_check,
-                            name, mod, compatible_pages, urls, domain, params,
+                            name, mod, compatible_pages, urls, domain,
+                            params, base_url, self._sitemap_urls,
                         ),
                     )
             except Exception as exc:
@@ -589,6 +632,7 @@ class AuditService:
         pages: list[dict[str, Any]],
         params: AuditParams,
         check_workers: int,
+        base_url: str,
     ) -> list[dict[str, Any]]:
         """
         Выполняет IO-bound проверку напрямую через await в текущем event loop.
@@ -597,10 +641,11 @@ class AuditService:
 
         Args:
             name: имя проверки.
-            mod: модуль проверки (broken_links или images).
+            mod: модуль проверки.
             pages: загруженные страницы в совместимом формате.
             params: параметры аудита.
             check_workers: количество одновременных запросов.
+            base_url: корневой URL сайта.
 
         Returns:
             Список найденных проблем.
@@ -625,6 +670,15 @@ class AuditService:
                 proxy_rotator=self._proxy_rotator,
             )
 
+        if name == "robots_sitemap":
+            return await mod.async_check(
+                pages,
+                base_url=base_url,
+                sitemap_urls=self._sitemap_urls,
+                proxy_rotator=self._proxy_rotator,
+                timeout=params.timeout,
+            )
+
         return []
 
     @staticmethod
@@ -635,6 +689,8 @@ class AuditService:
         urls: list[str],
         domain: str,
         params: AuditParams,
+        base_url: str,
+        sitemap_urls: set[str] | None,
     ) -> list[dict[str, Any]]:
         """
         Выполняет CPU-bound проверку синхронно.
@@ -649,6 +705,8 @@ class AuditService:
             urls: список URL.
             domain: домен сайта.
             params: параметры аудита.
+            base_url: корневой URL сайта.
+            sitemap_urls: множество URL из sitemap (или None).
 
         Returns:
             Список найденных проблем.
@@ -669,6 +727,24 @@ class AuditService:
 
         if name == "placeholders":
             return mod.check_many(pages, verbose=False)
+
+        if name == "mixed_content":
+            return mod.check_many(pages, verbose=False)
+
+        if name == "meta_quality":
+            return mod.check_many(pages, verbose=False)
+
+        if name == "heading_structure":
+            return mod.check_many(pages, verbose=False)
+
+        if name == "orphan_pages":
+            return mod.check(
+                pages,
+                all_urls=urls,
+                sitemap_urls=sitemap_urls,
+                base_url=base_url,
+                verbose=False,
+            )
 
         return []
 
