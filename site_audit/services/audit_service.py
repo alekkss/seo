@@ -125,7 +125,8 @@ class AuditService:
     Принимает настройки через конструктор (Dependency Injection),
     не зависит от конкретной точки входа (CLI/бот).
     При инициализации создаёт ProxyRotator из настроек —
-    один ротатор переиспользуется для всех запросов аудита.
+    один ротатор переиспользуется для всех запросов аудита,
+    включая проверки битых ссылок и картинок.
     Основной метод — run_audit_async (асинхронный).
     Метод run_audit — синхронная обёртка для удобства вызова.
     """
@@ -472,8 +473,8 @@ class AuditService:
     # Этап 3: Проверки
     # ═════════════════════════════════════════════════════════════════════
 
-    @staticmethod
     async def _run_checks_async(
+        self,
         base_url: str,
         urls: list[str],
         pages: list[dict[str, Any]],
@@ -486,7 +487,8 @@ class AuditService:
         запускаются в ThreadPoolExecutor через run_in_executor,
         чтобы не блокировать event loop.
         IO-bound проверки (broken_links, images) выполняются
-        в executor с внутренним async event loop.
+        в executor с внутренним async event loop и получают
+        proxy_rotator для выполнения запросов через прокси.
 
         Args:
             base_url: корневой URL сайта.
@@ -522,15 +524,16 @@ class AuditService:
                 extra={"context": {"check": name, "description": description}},
             )
 
-            AuditService._notify(on_progress, f"🔎 {description}...")
+            self._notify(on_progress, f"🔎 {description}...")
 
             t0 = time.time()
             try:
                 res = await loop.run_in_executor(
                     None,
                     partial(
-                        AuditService._execute_single_check,
+                        self._execute_single_check,
                         name, mod, pages, urls, domain, params, check_workers,
+                        self._proxy_rotator,
                     ),
                 )
             except Exception as exc:
@@ -565,10 +568,13 @@ class AuditService:
         domain: str,
         params: AuditParams,
         check_workers: int,
+        proxy_rotator: ProxyRotator | None = None,
     ) -> list[dict[str, Any]]:
         """
         Выполняет одну конкретную проверку, возвращает список проблем.
         Вызывается из executor (отдельного потока).
+        IO-bound проверки (broken_links, images) получают proxy_rotator
+        и timeout из params для корректной работы через прокси.
 
         Args:
             name: имя проверки.
@@ -578,6 +584,7 @@ class AuditService:
             domain: домен сайта.
             params: параметры аудита.
             check_workers: количество потоков для IO-bound проверок.
+            proxy_rotator: ротатор прокси (None — запросы напрямую).
 
         Returns:
             Список найденных проблем.
@@ -600,6 +607,8 @@ class AuditService:
                 compatible_page,
                 check_external=params.check_external_links,
                 workers=check_workers,
+                timeout=params.timeout,
+                proxy_rotator=proxy_rotator,
             )
 
         if name == "images":
@@ -607,6 +616,8 @@ class AuditService:
                 compatible_page,
                 max_size_kb=params.max_image_size_kb,
                 workers=check_workers,
+                timeout=params.timeout,
+                proxy_rotator=proxy_rotator,
             )
 
         if name == "duplicates":

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..utils import (
     AsyncResponse,
@@ -28,6 +28,9 @@ from ..utils import (
     parse_html,
 )
 from ..crawler import extract_links
+
+if TYPE_CHECKING:
+    from ..proxy import ProxyRotator
 
 CHECK_NAME = "broken_links"
 DESCRIPTION = "Битые внутренние и внешние ссылки"
@@ -48,18 +51,22 @@ async def _async_probe_url(
     *,
     session: Any,
     semaphore: asyncio.Semaphore,
-    timeout: int = 12,
+    proxy_rotator: ProxyRotator | None = None,
+    timeout: int = 30,
 ) -> dict[str, Any]:
     """
     Асинхронный HEAD-запрос к URL для проверки доступности.
 
     Если сервер не поддерживает HEAD (405/501), async_head
     автоматически выполнит GET-запрос.
+    Прокси-ротатор пробрасывается в async_head для выполнения
+    запросов через прокси-пул (если настроен).
 
     Args:
         url: проверяемый URL.
         session: aiohttp-сессия.
         semaphore: ограничитель параллельности.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         timeout: таймаут запроса в секундах.
 
     Returns:
@@ -76,6 +83,7 @@ async def _async_probe_url(
         url,
         session=session,
         semaphore=semaphore,
+        proxy_rotator=proxy_rotator,
         timeout=timeout,
         retries=1,
         retry_delay=1.0,
@@ -146,7 +154,8 @@ async def async_check(
     *,
     check_external: bool = True,
     max_concurrent: int = 50,
-    timeout: int = 12,
+    timeout: int = 30,
+    proxy_rotator: ProxyRotator | None = None,
     verbose: bool = True,
 ) -> list[dict[str, Any]]:
     """
@@ -158,11 +167,15 @@ async def async_check(
       3. Параллельно проверяет каждый уникальный URL через aiohttp.
       4. Формирует отчёт по битым ссылкам.
 
+    Прокси-ротатор (если передан) используется для всех HEAD/GET-запросов,
+    чтобы проверка ссылок шла через тот же прокси-пул, что и загрузка страниц.
+
     Args:
         pages: список словарей {"url", "resp", "html"}.
         check_external: проверять ли внешние ссылки.
         max_concurrent: максимум одновременных запросов.
         timeout: таймаут HTTP-запроса в секундах.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
@@ -216,6 +229,7 @@ async def async_check(
             url,
             session=session,
             semaphore=semaphore,
+            proxy_rotator=proxy_rotator,
             timeout=timeout,
         )
         async with lock:
@@ -272,7 +286,8 @@ def check(
     *,
     check_external: bool = True,
     workers: int = 15,
-    timeout: int = 12,
+    timeout: int = 30,
+    proxy_rotator: ProxyRotator | None = None,
     verbose: bool = True,
 ) -> list[dict[str, Any]]:
     """
@@ -281,20 +296,22 @@ def check(
     Вызывается из audit_service._execute_single_check внутри executor.
     Создаёт новый event loop для выполнения асинхронной проверки.
 
-    Параметр workers преобразуется в max_concurrent для aiohttp:
-    множитель x3 даёт хорошее соотношение параллельности и нагрузки.
+    Параметр workers напрямую определяет max_concurrent —
+    при workers=1 будет ровно 1 одновременный запрос,
+    что гарантирует последовательную работу через прокси.
 
     Args:
         pages: список словарей {"url", "resp", "html"}.
         check_external: проверять ли внешние ссылки.
-        workers: количество воркеров (преобразуется в max_concurrent).
+        workers: количество воркеров (= max_concurrent).
         timeout: таймаут HTTP-запроса в секундах.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         verbose: выводить ли прогресс.
 
     Returns:
         Список словарей с информацией о битых ссылках.
     """
-    max_concurrent = min(workers * 3, 80)
+    max_concurrent = max(workers, 1)
 
     loop = asyncio.new_event_loop()
     try:
@@ -304,6 +321,7 @@ def check(
                 check_external=check_external,
                 max_concurrent=max_concurrent,
                 timeout=timeout,
+                proxy_rotator=proxy_rotator,
                 verbose=verbose,
             )
         )

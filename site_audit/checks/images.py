@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ..utils import (
@@ -24,6 +24,9 @@ from ..utils import (
     is_html_response,
 )
 from ..crawler import extract_images
+
+if TYPE_CHECKING:
+    from ..proxy import ProxyRotator
 
 CHECK_NAME = "images"
 DESCRIPTION = "Битые и тяжёлые картинки"
@@ -45,7 +48,8 @@ async def _async_probe_image(
     *,
     session: Any,
     semaphore: asyncio.Semaphore,
-    timeout: int = 10,
+    proxy_rotator: ProxyRotator | None = None,
+    timeout: int = 30,
     max_size_kb: int = DEFAULT_MAX_SIZE_KB,
 ) -> dict[str, Any]:
     """
@@ -53,11 +57,14 @@ async def _async_probe_image(
 
     Если сервер не поддерживает HEAD (405/501), async_head
     автоматически выполнит GET-запрос.
+    Прокси-ротатор пробрасывается в async_head для выполнения
+    запросов через прокси-пул (если настроен).
 
     Args:
         src: URL изображения.
         session: aiohttp-сессия.
         semaphore: ограничитель параллельности.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         timeout: таймаут запроса в секундах.
         max_size_kb: порог тяжёлой картинки в килобайтах.
 
@@ -79,6 +86,7 @@ async def _async_probe_image(
         src,
         session=session,
         semaphore=semaphore,
+        proxy_rotator=proxy_rotator,
         timeout=timeout,
         retries=1,
         retry_delay=1.0,
@@ -166,7 +174,8 @@ async def async_check(
     *,
     max_size_kb: int = DEFAULT_MAX_SIZE_KB,
     max_concurrent: int = 60,
-    timeout: int = 10,
+    timeout: int = 30,
+    proxy_rotator: ProxyRotator | None = None,
     verbose: bool = True,
 ) -> list[dict[str, Any]]:
     """
@@ -178,11 +187,15 @@ async def async_check(
       3. Параллельно проверяет каждое уникальное изображение через aiohttp HEAD.
       4. Формирует отчёт по проблемным изображениям.
 
+    Прокси-ротатор (если передан) используется для всех HEAD/GET-запросов,
+    чтобы проверка картинок шла через тот же прокси-пул, что и загрузка страниц.
+
     Args:
         pages: список словарей {"url", "resp", "html"}.
         max_size_kb: порог тяжёлой картинки в килобайтах.
         max_concurrent: максимум одновременных запросов.
         timeout: таймаут HTTP-запроса в секундах.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         verbose: выводить ли прогресс в консоль.
 
     Returns:
@@ -226,6 +239,7 @@ async def async_check(
             src,
             session=session,
             semaphore=semaphore,
+            proxy_rotator=proxy_rotator,
             timeout=timeout,
             max_size_kb=max_size_kb,
         )
@@ -292,7 +306,8 @@ def check(
     *,
     max_size_kb: int = DEFAULT_MAX_SIZE_KB,
     workers: int = 15,
-    timeout: int = 10,
+    timeout: int = 30,
+    proxy_rotator: ProxyRotator | None = None,
     verbose: bool = True,
 ) -> list[dict[str, Any]]:
     """
@@ -301,17 +316,22 @@ def check(
     Вызывается из audit_service._execute_single_check внутри executor.
     Создаёт новый event loop для выполнения асинхронной проверки.
 
+    Параметр workers напрямую определяет max_concurrent —
+    при workers=1 будет ровно 1 одновременный запрос,
+    что гарантирует последовательную работу через прокси.
+
     Args:
         pages: список словарей {"url", "resp", "html"}.
         max_size_kb: порог тяжёлой картинки в килобайтах.
-        workers: количество воркеров (преобразуется в max_concurrent).
+        workers: количество воркеров (= max_concurrent).
         timeout: таймаут HTTP-запроса в секундах.
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
         verbose: выводить ли прогресс.
 
     Returns:
         Список словарей с информацией о проблемных изображениях.
     """
-    max_concurrent = min(workers * 4, 80)
+    max_concurrent = max(workers, 1)
 
     loop = asyncio.new_event_loop()
     try:
@@ -321,6 +341,7 @@ def check(
                 max_size_kb=max_size_kb,
                 max_concurrent=max_concurrent,
                 timeout=timeout,
+                proxy_rotator=proxy_rotator,
                 verbose=verbose,
             )
         )
