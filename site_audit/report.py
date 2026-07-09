@@ -31,6 +31,11 @@ _SHEET_NAMES = {
     "redirects": "Редиректы",
     "duplicates": "Дубликаты",
     "placeholders": "Заглушки",
+    "robots_sitemap": "Robots.txt и Sitemap",
+    "mixed_content": "Mixed Content (HTTP/HTTPS)",
+    "orphan_pages": "Страницы-сироты",
+    "meta_quality": "Качество мета-тегов",
+    "heading_structure": "Структура заголовков",
 }
 
 # Приоритетные колонки (выводятся первыми)
@@ -266,6 +271,19 @@ _COLUMN_LABELS = {
     "findings": "Находки",
     "findings_count": "Кол-во находок",
     "severity": "Важность",
+    # ── Новые проверки ──────────────────────────────────────────────────
+    "resource_url": "URL ресурса",
+    "tag": "HTML-тег",
+    "attribute": "Атрибут",
+    "content_type": "Тип контента",
+    "field": "Поле",
+    "issue_type": "Тип проблемы",
+    "message": "Описание",
+    "length": "Длина (симв.)",
+    "heading_text": "Текст заголовка",
+    "inbound_links": "Входящих ссылок",
+    "in_sitemap": "В Sitemap?",
+    "detail": "Подробности",
 }
 
 
@@ -298,7 +316,7 @@ def _auto_width(ws, columns: list[str], rows: list[dict]):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# HTML (без изменений)
+# HTML
 # ═════════════════════════════════════════════════════════════════════════════
 
 _CHECK_TITLES = {
@@ -309,6 +327,11 @@ _CHECK_TITLES = {
     "redirects": "Редиректы",
     "duplicates": "Дубликаты контента",
     "placeholders": "Заглушки и placeholder-тексты",
+    "robots_sitemap": "Robots.txt и Sitemap",
+    "mixed_content": "Mixed Content (HTTP-ресурсы на HTTPS)",
+    "orphan_pages": "Страницы-сироты",
+    "meta_quality": "Качество мета-тегов",
+    "heading_structure": "Структура заголовков H1–H6",
 }
 
 
