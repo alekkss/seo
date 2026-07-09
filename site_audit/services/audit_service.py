@@ -50,6 +50,11 @@ from site_audit.utils import (
 
 logger = get_logger("service.audit")
 
+# ── Проверки, которые выполняют свои HTTP-запросы (IO-bound, async) ────────
+# Эти проверки имеют async_check() и должны вызываться напрямую через await
+# в текущем event loop, чтобы семафоры прокси работали корректно.
+_ASYNC_IO_CHECKS: frozenset[str] = frozenset({"broken_links", "images"})
+
 
 # ── Реестр проверок ───────────────────────────────────────────
 
@@ -127,6 +132,14 @@ class AuditService:
     При инициализации создаёт ProxyRotator из настроек —
     один ротатор переиспользуется для всех запросов аудита,
     включая проверки битых ссылок и картинок.
+
+    IO-bound проверки (broken_links, images) выполняются напрямую
+    через await в текущем event loop, чтобы семафоры прокси
+    работали корректно (без конфликтов между разными loop'ами).
+
+    CPU-bound проверки (seo, empty_pages, duplicates, placeholders)
+    выполняются в ThreadPoolExecutor через run_in_executor.
+
     Основной метод — run_audit_async (асинхронный).
     Метод run_audit — синхронная обёртка для удобства вызова.
     """
@@ -233,7 +246,7 @@ class AuditService:
         Этапы:
           1. Сбор URL (sitemap / BFS-обход) — async
           2. Загрузка страниц (aiohttp + семафор) — async
-          3. Проверки — CPU-bound в executor
+          3. Проверки — IO-bound через await, CPU-bound в executor
           4. Генерация отчётов — в executor (IO-bound файловые операции)
 
         Args:
@@ -483,12 +496,14 @@ class AuditService:
     ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
         """
         Выполняет выбранные проверки над загруженными страницами.
-        CPU-bound проверки (seo, empty_pages, duplicates, placeholders)
-        запускаются в ThreadPoolExecutor через run_in_executor,
-        чтобы не блокировать event loop.
-        IO-bound проверки (broken_links, images) выполняются
-        в executor с внутренним async event loop и получают
-        proxy_rotator для выполнения запросов через прокси.
+
+        Два режима выполнения:
+          - IO-bound проверки (broken_links, images) — вызываются напрямую
+            через await в текущем event loop, чтобы семафоры прокси
+            из ProxyRotator работали корректно (все в одном loop).
+          - CPU-bound проверки (seo, empty_pages, duplicates, placeholders) —
+            запускаются в ThreadPoolExecutor через run_in_executor,
+            чтобы не блокировать event loop.
 
         Args:
             base_url: корневой URL сайта.
@@ -506,6 +521,7 @@ class AuditService:
         check_workers = min(params.workers, 5)
 
         loop = asyncio.get_running_loop()
+        compatible_pages = _make_compatible_pages(pages)
 
         for name in params.check_names:
             if name not in ALL_CHECKS:
@@ -528,14 +544,21 @@ class AuditService:
 
             t0 = time.time()
             try:
-                res = await loop.run_in_executor(
-                    None,
-                    partial(
-                        self._execute_single_check,
-                        name, mod, pages, urls, domain, params, check_workers,
-                        self._proxy_rotator,
-                    ),
-                )
+                if name in _ASYNC_IO_CHECKS:
+                    # IO-bound: вызываем async_check напрямую в текущем loop,
+                    # чтобы семафоры прокси работали в одном event loop
+                    res = await self._execute_async_check(
+                        name, mod, compatible_pages, params, check_workers,
+                    )
+                else:
+                    # CPU-bound: выносим в executor, чтобы не блокировать loop
+                    res = await loop.run_in_executor(
+                        None,
+                        partial(
+                            self._execute_sync_check,
+                            name, mod, compatible_pages, urls, domain, params,
+                        ),
+                    )
             except Exception as exc:
                 logger.error(
                     "Ошибка в проверке",
@@ -559,72 +582,93 @@ class AuditService:
 
         return results, summaries
 
+    async def _execute_async_check(
+        self,
+        name: str,
+        mod: Any,
+        pages: list[dict[str, Any]],
+        params: AuditParams,
+        check_workers: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Выполняет IO-bound проверку напрямую через await в текущем event loop.
+        Это гарантирует, что семафоры прокси из ProxyRotator работают
+        в том же event loop, где были созданы — без конфликтов.
+
+        Args:
+            name: имя проверки.
+            mod: модуль проверки (broken_links или images).
+            pages: загруженные страницы в совместимом формате.
+            params: параметры аудита.
+            check_workers: количество одновременных запросов.
+
+        Returns:
+            Список найденных проблем.
+        """
+        max_concurrent = max(check_workers, 1)
+
+        if name == "broken_links":
+            return await mod.async_check(
+                pages,
+                check_external=params.check_external_links,
+                max_concurrent=max_concurrent,
+                timeout=params.timeout,
+                proxy_rotator=self._proxy_rotator,
+            )
+
+        if name == "images":
+            return await mod.async_check(
+                pages,
+                max_size_kb=params.max_image_size_kb,
+                max_concurrent=max_concurrent,
+                timeout=params.timeout,
+                proxy_rotator=self._proxy_rotator,
+            )
+
+        return []
+
     @staticmethod
-    def _execute_single_check(
+    def _execute_sync_check(
         name: str,
         mod: Any,
         pages: list[dict[str, Any]],
         urls: list[str],
         domain: str,
         params: AuditParams,
-        check_workers: int,
-        proxy_rotator: ProxyRotator | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Выполняет одну конкретную проверку, возвращает список проблем.
+        Выполняет CPU-bound проверку синхронно.
         Вызывается из executor (отдельного потока).
-        IO-bound проверки (broken_links, images) получают proxy_rotator
-        и timeout из params для корректной работы через прокси.
+        Эти проверки не делают HTTP-запросов — работают только
+        с уже загруженным HTML, поэтому не нуждаются в прокси.
 
         Args:
             name: имя проверки.
             mod: модуль проверки.
-            pages: загруженные страницы.
+            pages: загруженные страницы в совместимом формате.
             urls: список URL.
             domain: домен сайта.
             params: параметры аудита.
-            check_workers: количество потоков для IO-bound проверок.
-            proxy_rotator: ротатор прокси (None — запросы напрямую).
 
         Returns:
             Список найденных проблем.
         """
-        compatible_page = _make_compatible_pages(pages)
-
         if name == "empty_pages":
             res = mod.check_many(
-                compatible_page,
+                pages,
                 min_text_length=params.min_text_length,
             )
             return mod.filter_empty(res)
 
         if name == "seo":
-            res = mod.check_many(compatible_page)
+            res = mod.check_many(pages)
             return mod.filter_with_issues(res)
 
-        if name == "broken_links":
-            return mod.check(
-                compatible_page,
-                check_external=params.check_external_links,
-                workers=check_workers,
-                timeout=params.timeout,
-                proxy_rotator=proxy_rotator,
-            )
-
-        if name == "images":
-            return mod.check(
-                compatible_page,
-                max_size_kb=params.max_image_size_kb,
-                workers=check_workers,
-                timeout=params.timeout,
-                proxy_rotator=proxy_rotator,
-            )
-
         if name == "duplicates":
-            return mod.check(compatible_page, verbose=False)
+            return mod.check(pages, verbose=False)
 
         if name == "placeholders":
-            return mod.check_many(compatible_page, verbose=False)
+            return mod.check_many(pages, verbose=False)
 
         return []
 
