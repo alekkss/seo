@@ -32,7 +32,7 @@ _SHEET_NAMES = {
     "duplicates": "Дубликаты",
     "placeholders": "Заглушки",
     "robots_sitemap": "Robots.txt и Sitemap",
-    "mixed_content": "Mixed Content (HTTP/HTTPS)",
+    "mixed_content": "Mixed Content",
     "orphan_pages": "Страницы-сироты",
     "meta_quality": "Качество мета-тегов",
     "heading_structure": "Структура заголовков",
