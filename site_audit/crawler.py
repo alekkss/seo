@@ -51,6 +51,11 @@ _ASSET_EXTENSIONS: frozenset[str] = frozenset((
 # Максимальная глубина вложенности sitemap_index → sitemap
 _MAX_SITEMAP_DEPTH: int = 3
 
+# Схемы URL, которые не являются HTTP-ссылками и не подлежат проверке.
+# data: — inline-ресурсы в base64, blob: — объекты в памяти браузера,
+# javascript: — псевдо-ссылки для скриптов.
+_NON_HTTP_SCHEMES: tuple[str, ...] = ("data:", "blob:", "javascript:")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Фабрика ProxyRotator
@@ -518,6 +523,9 @@ def extract_links(html: str, page_url: str) -> dict[str, list[str]]:
 def extract_images(html: str, page_url: str) -> list[dict[str, str | bool]]:
     """
     Извлекает все изображения <img> со страницы.
+    Пропускает не-HTTP URL: data: (inline base64), blob: (объекты
+    в памяти браузера), javascript: (псевдо-ссылки) — они не подлежат
+    проверке через HEAD-запрос и вызывают ошибки aiohttp.
 
     Args:
         html: HTML-код страницы.
@@ -540,7 +548,18 @@ def extract_images(html: str, page_url: str) -> list[dict[str, str | bool]]:
         if not src:
             continue
 
+        # Пропускаем не-HTTP схемы: data:, blob:, javascript:
+        # Эти URL не являются сетевыми ресурсами и не подлежат проверке
+        if src.startswith(_NON_HTTP_SCHEMES):
+            continue
+
         absolute = make_absolute(page_url, src)
+
+        # Дополнительная проверка: после приведения к абсолютному URL
+        # он должен начинаться с http:// или https://
+        if not absolute.startswith(("http://", "https://")):
+            continue
+
         alt = img.get("alt")
 
         images.append({
