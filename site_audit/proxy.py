@@ -9,6 +9,11 @@
   - mark_soft_fail() — возможно проблема сайта (таймаут, 502/503):
     увеличивается счётчик ошибок, cooldown только после max_fails подряд.
 
+Preflight-проверка:
+  - preflight_check(target_url) — перед аудитом проверяет каждый прокси
+    одним GET-запросом к целевому сайту. Нерабочие прокси сразу уходят
+    в cooldown, в пуле остаются только проверенные.
+
 Использование:
     rotator = ProxyRotator.from_file("proxies.txt", cooldown=120, max_fails=3)
     proxy_url = rotator.get_next()       # "http://login:password@host:port" или None
@@ -16,6 +21,11 @@
     rotator.mark_soft_fail(proxy_url)    # мягкая ошибка (таймаут)
     rotator.mark_hard_fail(proxy_url)    # жёсткая ошибка (прокси мёртв)
     rotator.mark_success(proxy_url)      # успех — сброс счётчика
+
+    # Preflight-проверка перед аудитом
+    result = await rotator.preflight_check("https://example.com", timeout=15)
+    if result.passed == 0:
+        print("Ни один прокси не работает с этим сайтом!")
 """
 from __future__ import annotations
 
@@ -66,6 +76,29 @@ class ProxyEntry:
         return f"{self.host}:{self.port}"
 
 
+@dataclass
+class PreflightResult:
+    """
+    Результат preflight-проверки прокси перед аудитом.
+
+    Attributes:
+        total: общее количество прокси в пуле.
+        passed: количество прокси, успешно подключившихся к целевому сайту.
+        failed: количество прокси, не прошедших проверку.
+        details: детали по каждому прокси (адрес, статус, ошибка).
+    """
+
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    details: list[dict[str, str | bool]] = field(default_factory=list)
+
+    @property
+    def all_failed(self) -> bool:
+        """Все прокси не прошли проверку."""
+        return self.total > 0 and self.passed == 0
+
+
 class ProxyRotator:
     """
     Round-robin ротатор прокси с мягким/жёстким отказом и семафорами.
@@ -81,6 +114,7 @@ class ProxyRotator:
     - Каждый прокси имеет свой asyncio.Semaphore для ограничения
       одновременных соединений.
     - Если все прокси в cooldown — возвращает None (запрос пойдёт напрямую).
+    - preflight_check() позволяет заранее отсеять нерабочие прокси.
 
     Потокобезопасность обеспечена через threading.Lock, что корректно
     работает и в asyncio (Lock захватывается на микросекунды без I/O).
@@ -448,3 +482,212 @@ class ProxyRotator:
                 })
 
         return result
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Preflight-проверка прокси с целевым сайтом
+    # ═════════════════════════════════════════════════════════════════════
+
+    async def preflight_check(
+        self,
+        target_url: str,
+        *,
+        timeout: int = 15,
+    ) -> PreflightResult:
+        """
+        Проверяет работоспособность каждого прокси с целевым сайтом.
+
+        Делает один GET-запрос к target_url через каждый прокси параллельно.
+        Прокси считается рабочим, если получен HTTP-ответ с кодом < 500
+        (даже 403/404 означает, что прокси доставил запрос до сервера).
+        Нерабочие прокси сразу отправляются в hard-fail cooldown.
+
+        Проверяются только активные прокси (не в cooldown).
+
+        Args:
+            target_url: URL целевого сайта (главная страница).
+            timeout: таймаут одного запроса в секундах.
+
+        Returns:
+            PreflightResult со статистикой проверки.
+        """
+        import aiohttp
+
+        if not self._proxies:
+            logger.info("Preflight-проверка пропущена: прокси не настроены")
+            return PreflightResult(total=0, passed=0, failed=0)
+
+        # Собираем только активные прокси (не в cooldown)
+        now = time.monotonic()
+        active_proxies: list[ProxyEntry] = []
+        with self._lock:
+            for proxy in self._proxies:
+                if not proxy.is_in_cooldown:
+                    active_proxies.append(proxy)
+                elif (now - proxy.failed_at) >= self._cooldown:
+                    # Cooldown истёк — восстанавливаем для проверки
+                    proxy.failed_at = 0.0
+                    proxy.fail_count = 0
+                    active_proxies.append(proxy)
+
+        if not active_proxies:
+            logger.warning("Preflight-проверка: все прокси уже в cooldown")
+            return PreflightResult(
+                total=len(self._proxies),
+                passed=0,
+                failed=len(self._proxies),
+            )
+
+        logger.info(
+            "Запуск preflight-проверки прокси",
+            extra={"context": {
+                "target_url": target_url,
+                "proxies_to_check": len(active_proxies),
+                "timeout": timeout,
+            }},
+        )
+
+        # Параллельная проверка всех прокси
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        results: list[dict[str, str | bool]] = []
+        passed = 0
+        failed = 0
+
+        async def _check_one_proxy(proxy: ProxyEntry) -> dict[str, str | bool]:
+            """Проверяет один прокси одним GET-запросом к целевому сайту."""
+            proxy_label = str(proxy)
+            proxy_url = proxy.url
+
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=client_timeout,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                    },
+                ) as session:
+                    async with session.get(
+                        target_url,
+                        proxy=proxy_url,
+                        allow_redirects=True,
+                        ssl=False,
+                    ) as response:
+                        # Любой ответ < 500 означает, что прокси доставил запрос
+                        # 403/404 — сайт ответил, прокси работает
+                        # 502/503/504 — возможно проблема прокси или сайта
+                        if response.status < 500:
+                            return {
+                                "proxy": proxy_label,
+                                "ok": True,
+                                "status": str(response.status),
+                                "error": "",
+                            }
+                        else:
+                            return {
+                                "proxy": proxy_label,
+                                "ok": False,
+                                "status": str(response.status),
+                                "error": f"HTTP {response.status}",
+                            }
+
+            except asyncio.TimeoutError:
+                return {
+                    "proxy": proxy_label,
+                    "ok": False,
+                    "status": "",
+                    "error": "Таймаут соединения",
+                }
+            except aiohttp.ClientProxyConnectionError as exc:
+                return {
+                    "proxy": proxy_label,
+                    "ok": False,
+                    "status": "",
+                    "error": f"Ошибка подключения к прокси: {exc}",
+                }
+            except aiohttp.ClientHttpProxyError as exc:
+                return {
+                    "proxy": proxy_label,
+                    "ok": False,
+                    "status": str(exc.status) if hasattr(exc, "status") else "",
+                    "error": f"HTTP-ошибка прокси: {exc}",
+                }
+            except aiohttp.ServerDisconnectedError:
+                return {
+                    "proxy": proxy_label,
+                    "ok": False,
+                    "status": "",
+                    "error": "Сервер разорвал соединение",
+                }
+            except aiohttp.ClientError as exc:
+                return {
+                    "proxy": proxy_label,
+                    "ok": False,
+                    "status": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            except OSError as exc:
+                return {
+                    "proxy": proxy_label,
+                    "ok": False,
+                    "status": "",
+                    "error": f"Ошибка сети: {exc}",
+                }
+
+        # Запускаем все проверки параллельно
+        tasks = [_check_one_proxy(proxy) for proxy in active_proxies]
+        check_results = await asyncio.gather(*tasks)
+
+        # Обрабатываем результаты и отправляем нерабочие в cooldown
+        for proxy, result in zip(active_proxies, check_results):
+            results.append(result)
+            if result["ok"]:
+                passed += 1
+                self.mark_success(proxy.url)
+                logger.info(
+                    "Preflight: прокси работает",
+                    extra={"context": {
+                        "proxy": str(proxy),
+                        "status": result["status"],
+                    }},
+                )
+            else:
+                failed += 1
+                self.mark_hard_fail(proxy.url)
+                logger.warning(
+                    "Preflight: прокси не работает с целевым сайтом",
+                    extra={"context": {
+                        "proxy": str(proxy),
+                        "error": result["error"],
+                    }},
+                )
+
+        preflight_result = PreflightResult(
+            total=len(active_proxies),
+            passed=passed,
+            failed=failed,
+            details=results,
+        )
+
+        # Итоговое логирование
+        if preflight_result.all_failed:
+            logger.warning(
+                "Preflight-проверка: ни один прокси не работает с целевым сайтом",
+                extra={"context": {
+                    "target_url": target_url,
+                    "total": preflight_result.total,
+                }},
+            )
+        else:
+            logger.info(
+                "Preflight-проверка завершена",
+                extra={"context": {
+                    "target_url": target_url,
+                    "passed": passed,
+                    "failed": failed,
+                    "total": len(active_proxies),
+                }},
+            )
+
+        return preflight_result

@@ -11,6 +11,9 @@
 что позволяет использовать await для отправки прогресса
 и избежать проблем с межпоточной синхронизацией.
 
+Перед аудитом выполняется preflight-проверка прокси —
+результат отправляется в чат через on_progress callback.
+
 Использование:
     from site_audit.bot.handlers import register_handlers
 
@@ -565,11 +568,24 @@ async def _cb_run_audit(
 
     session.state = UserState.AUDIT_RUNNING
 
+    # Определяем, будет ли preflight-проверка прокси
+    audit_service: AuditService = context.bot_data["audit_service"]
+    has_proxy = (
+        audit_service.proxy_rotator is not None
+        and audit_service.proxy_rotator.is_enabled
+    )
+    proxy_note = (
+        "\n🔌 Сначала проверю работоспособность прокси с сайтом..."
+        if has_proxy
+        else ""
+    )
+
     await _safe_edit_text(
         query,
         f"⏳ *Аудит запущен*\n\n"
         f"🌐 URL: `{session.url}`\n"
-        f"📋 Проверок: {len(enabled_checks)}\n\n"
+        f"📋 Проверок: {len(enabled_checks)}"
+        f"{proxy_note}\n\n"
         f"Это может занять несколько минут...",
         parse_mode="Markdown",
         reply_markup=build_audit_running_keyboard(),
@@ -581,10 +597,10 @@ async def _cb_run_audit(
             "user_id": session.user_id,
             "url": session.url,
             "checks": enabled_checks,
+            "proxy_enabled": has_proxy,
         }},
     )
 
-    audit_service: AuditService = context.bot_data["audit_service"]
     settings: Settings = context.bot_data["settings"]
     bot = context.bot
     chat_id = query.message.chat_id

@@ -155,11 +155,15 @@ def main(argv: list[str] | None = None) -> None:
         if verbose:
             print("  ⚠️  Прокси отключены флагом --no-proxy")
 
+    # ── Шапка аудита ──────────────────────────────────────────
+    # Показываем начальное состояние прокси.
+    # Актуальное состояние после preflight-проверки будет выведено
+    # через on_progress внутри run_audit_async.
     print(f"\n{'='*60}")
     print(f"  АУДИТ САЙТА: {params.base_url}")
     if service.proxy_rotator is not None and service.proxy_rotator.is_enabled:
         rotator = service.proxy_rotator
-        print(f"  Прокси: {rotator.total} шт. (активных: {rotator.healthy_count})")
+        print(f"  Прокси: {rotator.total} шт. (будет preflight-проверка)")
     else:
         print("  Прокси: отключены")
     print(f"{'='*60}\n")

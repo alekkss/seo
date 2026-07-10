@@ -43,7 +43,7 @@ from site_audit.checks import (
 from site_audit.config.logger import get_logger, set_trace_id
 from site_audit.config.settings import Settings
 from site_audit.crawler import async_crawl, async_try_sitemap, create_proxy_rotator
-from site_audit.proxy import ProxyRotator
+from site_audit.proxy import PreflightResult, ProxyRotator
 from site_audit.report import save_all
 from site_audit.utils import (
     AsyncResponse,
@@ -162,6 +162,11 @@ class AuditService:
     один ротатор переиспользуется для всех запросов аудита,
     включая проверки битых ссылок, картинок и robots.txt.
 
+    Перед началом аудита выполняет preflight-проверку прокси:
+    один GET-запрос к целевому сайту через каждый прокси.
+    Нерабочие прокси сразу исключаются из пула. Если ни один
+    прокси не работает — аудит продолжается без прокси.
+
     IO-bound проверки (broken_links, images, robots_sitemap) выполняются
     напрямую через await в текущем event loop, чтобы семафоры прокси
     работали корректно (без конфликтов между разными loop'ами).
@@ -276,6 +281,7 @@ class AuditService:
         """
         Запускает полный цикл аудита асинхронно.
         Этапы:
+          0. Preflight-проверка прокси с целевым сайтом — async
           1. Сбор URL (sitemap / BFS-обход) — async
           2. Загрузка страниц (aiohttp + семафор) — async
           3. Проверки — IO-bound через await, CPU-bound в executor
@@ -320,6 +326,9 @@ class AuditService:
                 extra={"context": {"url": base_url, "trace_id": trace_id}},
             )
             self._notify(on_progress, f"🔍 Начинаю аудит: {base_url}")
+
+        # ── 0. Preflight-проверка прокси ──────────────────────────
+        await self._run_preflight(base_url, params, on_progress)
 
         # ── 1. Сбор URL ──────────────────────────────────────────
         self._notify(on_progress, "📋 Этап 1/4: Сбор URL...")
@@ -400,6 +409,78 @@ class AuditService:
             html_path=html_path,
             elapsed_seconds=round(elapsed, 1),
         )
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Этап 0: Preflight-проверка прокси
+    # ═════════════════════════════════════════════════════════════════════
+
+    async def _run_preflight(
+        self,
+        base_url: str,
+        params: AuditParams,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> None:
+        """
+        Выполняет preflight-проверку прокси с целевым сайтом.
+
+        Если прокси не настроены или отключены — пропускает.
+        Если часть прокси прошла проверку — логирует и продолжает.
+        Если ни один прокси не прошёл — отключает прокси и
+        продолжает аудит напрямую (graceful degradation).
+
+        Args:
+            base_url: URL целевого сайта.
+            params: параметры аудита (используется timeout).
+            on_progress: callback для прогресса.
+        """
+        if self._proxy_rotator is None or not self._proxy_rotator.is_enabled:
+            return
+
+        self._notify(
+            on_progress,
+            f"🔌 Проверка прокси с сайтом {base_url}...",
+        )
+
+        # Таймаут preflight чуть меньше основного — это быстрая проверка
+        preflight_timeout = min(params.timeout, 15)
+
+        result: PreflightResult = await self._proxy_rotator.preflight_check(
+            base_url,
+            timeout=preflight_timeout,
+        )
+
+        if result.total == 0:
+            return
+
+        if result.all_failed:
+            # Ни один прокси не работает с этим сайтом — отключаем прокси
+            self._proxy_rotator = None
+            self._notify(
+                on_progress,
+                f"⚠️ Ни один прокси ({result.total} шт.) не работает "
+                f"с {base_url}. Продолжаю без прокси.",
+            )
+            logger.warning(
+                "Preflight: все прокси отклонены, аудит продолжится без прокси",
+                extra={"context": {
+                    "target_url": base_url,
+                    "total_checked": result.total,
+                }},
+            )
+        else:
+            self._notify(
+                on_progress,
+                f"✅ Прокси проверены: {result.passed}/{result.total} работают",
+            )
+            logger.info(
+                "Preflight завершён: рабочие прокси отобраны",
+                extra={"context": {
+                    "target_url": base_url,
+                    "passed": result.passed,
+                    "failed": result.failed,
+                    "total": result.total,
+                }},
+            )
 
     # ═════════════════════════════════════════════════════════════════════
     # Этап 1: Сбор URL (async)
