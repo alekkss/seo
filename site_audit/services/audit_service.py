@@ -127,6 +127,12 @@ class AuditParams:
     workers: int = 10
     delay: float = 0.0
 
+    # Жёсткий предохранитель от переполнения памяти: применяется
+    # к итоговому списку URL независимо от источника (sitemap или BFS),
+    # в отличие от limit (по умолчанию выключен) и max_crawl_pages
+    # (действует только на BFS-обход).
+    max_total_pages: int = 2000
+
     # Сетевые настройки (увеличены для устойчивости к медленным серверам)
     timeout: int = 30
     retries: int = 3
@@ -178,6 +184,14 @@ class AuditService:
     Основной метод — run_audit_async (асинхронный).
     Метод run_audit — синхронная обёртка для удобства вызова.
     """
+
+    # Размер одной порции при загрузке страниц (этап 2). Ограничивает
+    # количество одновременно находящихся "в полёте" задач и сетевых
+    # буферов aiohttp. НЕ влияет на итоговый объём собранных HTML —
+    # это уже ограничено AuditParams.max_total_pages. Задача батчинга —
+    # сгладить пиковую нагрузку и дать сборщику мусора Python шанс
+    # освободить промежуточные объекты между порциями.
+    _DOWNLOAD_BATCH_SIZE: int = 300
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -231,6 +245,7 @@ class AuditService:
             limit=s.default_limit,
             workers=s.default_workers,
             delay=s.default_delay,
+            max_total_pages=s.default_max_total_pages,
             timeout=s.default_timeout,
             retries=s.default_retries,
             min_text_length=s.default_min_text_length,
@@ -497,6 +512,12 @@ class AuditService:
         Сохраняет полный набор URL из sitemap в self._sitemap_urls
         до применения limit — для использования в orphan_pages и robots_sitemap.
 
+        Применяет два независимых ограничения к итоговому списку:
+          1. params.limit — если задан явно (> 0), обрезает список.
+          2. params.max_total_pages — жёсткий предохранитель, применяется
+             ВСЕГДА, независимо от источника URL и от того, задан ли limit.
+             Защищает от переполнения памяти на сайтах с огромным sitemap.
+
         Args:
             base_url: корневой URL сайта.
             params: параметры аудита.
@@ -539,6 +560,21 @@ class AuditService:
         if params.limit > 0:
             urls = urls[: params.limit]
 
+        # Глобальный предохранитель от переполнения памяти: обрезаем
+        # список ДО загрузки страниц, если он всё ещё больше допустимого.
+        # Срабатывает независимо от того, был ли задан --limit, и
+        # независимо от источника (sitemap или BFS).
+        if len(urls) > params.max_total_pages:
+            logger.warning(
+                "Превышен глобальный лимит страниц (max_total_pages), "
+                "список URL обрезан для защиты от переполнения памяти",
+                extra={"context": {
+                    "found": len(urls),
+                    "max_total_pages": params.max_total_pages,
+                }},
+            )
+            urls = urls[: params.max_total_pages]
+
         return urls
 
     # ═════════════════════════════════════════════════════════════════════
@@ -557,6 +593,16 @@ class AuditService:
         Переиспользует одну TCP-сессию для всех запросов.
         Передаёт ProxyRotator для выполнения запросов через прокси.
 
+        Загружает URL порциями по _DOWNLOAD_BATCH_SIZE штук вместо одного
+        gather на весь список: это ограничивает пиковое количество
+        одновременно "в полёте" задач и сетевых буферов aiohttp, а также
+        даёт сборщику мусора Python возможность освободить промежуточные
+        объекты предыдущей порции, пока грузится следующая.
+
+        Передаёт keep_raw_content=False в async_fetch_many, так как здесь
+        используется только resp.text (см. ниже) — байты тела ответа не
+        нужны и не сохраняются, что вдвое сокращает память на страницу.
+
         Args:
             urls: список URL для загрузки.
             params: параметры аудита (workers, timeout, retries, delay).
@@ -573,35 +619,47 @@ class AuditService:
             timeout_connect=min(10, params.timeout),
         )
 
+        pages: list[dict[str, Any]] = []
+        total = len(urls)
+        done = 0
+
         try:
-            responses = await async_fetch_many(
-                urls,
-                session=session,
-                semaphore=semaphore,
-                proxy_rotator=self._proxy_rotator,
-                timeout=params.timeout,
-                retries=params.retries,
-                delay=params.delay,
-                on_progress=on_progress,
-                progress_every=150,
-            )
+            for batch_start in range(0, total, self._DOWNLOAD_BATCH_SIZE):
+                batch_urls = urls[batch_start: batch_start + self._DOWNLOAD_BATCH_SIZE]
+
+                responses = await async_fetch_many(
+                    batch_urls,
+                    session=session,
+                    semaphore=semaphore,
+                    proxy_rotator=self._proxy_rotator,
+                    timeout=params.timeout,
+                    retries=params.retries,
+                    delay=params.delay,
+                    keep_raw_content=False,
+                )
+
+                for resp in responses:
+                    html: str | None = None
+                    if is_async_response_ok(resp):
+                        html = resp.text
+                    pages.append({
+                        "url": resp.url,
+                        "resp": resp,
+                        "html": html,
+                    })
+
+                done += len(batch_urls)
+                self._notify(on_progress, f"⬇️ Загружено {done}/{total}...")
+                logger.debug(
+                    "Порция страниц загружена",
+                    extra={"context": {"done": done, "total": total}},
+                )
         finally:
             await session.close()
             logger.info(
                 "Aiohttp-сессия загрузки закрыта",
                 extra={"context": {"total_urls": len(urls)}},
             )
-
-        pages: list[dict[str, Any]] = []
-        for resp in responses:
-            html: str | None = None
-            if is_async_response_ok(resp):
-                html = resp.text
-            pages.append({
-                "url": resp.url,
-                "resp": resp,
-                "html": html,
-            })
 
         return pages
 

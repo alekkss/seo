@@ -38,6 +38,14 @@ class Settings:
     default_workers: int = 10
     default_delay: float = 0.0
 
+    # Жёсткий предохранитель от переполнения памяти: максимальное общее
+    # количество страниц для аудита, применяется НЕЗАВИСИМО от источника
+    # URL (sitemap или BFS-обход). В отличие от default_max_crawl_pages
+    # (который ограничивает только BFS-обход) и default_limit (который
+    # по умолчанию выключен — 0 означает "без лимита"), этот параметр
+    # всегда активен и защищает от случаев вроде sitemap с 20000+ URL.
+    default_max_total_pages: int = 2000
+
     # Сетевые настройки (увеличены для устойчивости к медленным серверам)
     default_timeout: int = 30
     default_connect_timeout: int = 10
@@ -141,6 +149,11 @@ def _load_settings() -> Settings:
     default_workers = int(os.getenv("DEFAULT_WORKERS", "10"))
     default_delay = float(os.getenv("DEFAULT_DELAY", "0.0"))
 
+    # Глобальный предохранитель по общему числу страниц
+    default_max_total_pages = int(
+        os.getenv("DEFAULT_MAX_TOTAL_PAGES", "2000")
+    )
+
     # Сетевые настройки
     default_timeout = int(os.getenv("DEFAULT_TIMEOUT", "30"))
     default_connect_timeout = int(os.getenv("DEFAULT_CONNECT_TIMEOUT", "10"))
@@ -168,6 +181,7 @@ def _load_settings() -> Settings:
     _validate_positive_int(default_max_depth, "DEFAULT_MAX_DEPTH")
     _validate_positive_int(default_limit, "DEFAULT_LIMIT")
     _validate_positive_int(default_workers, "DEFAULT_WORKERS")
+    _validate_positive_int(default_max_total_pages, "DEFAULT_MAX_TOTAL_PAGES")
     _validate_positive_int(default_timeout, "DEFAULT_TIMEOUT")
     _validate_positive_int(default_connect_timeout, "DEFAULT_CONNECT_TIMEOUT")
     _validate_positive_int(default_retries, "DEFAULT_RETRIES")
@@ -192,6 +206,11 @@ def _load_settings() -> Settings:
     if default_retries < 0:
         raise ValueError(
             f"Переменная DEFAULT_RETRIES не может быть отрицательной: {default_retries}"
+        )
+    if default_max_total_pages < 1:
+        raise ValueError(
+            f"Переменная DEFAULT_MAX_TOTAL_PAGES должна быть >= 1: "
+            f"{default_max_total_pages}"
         )
 
     # Валидация прокси
@@ -226,6 +245,7 @@ def _load_settings() -> Settings:
         default_limit=default_limit,
         default_workers=default_workers,
         default_delay=default_delay,
+        default_max_total_pages=default_max_total_pages,
         default_timeout=default_timeout,
         default_connect_timeout=default_connect_timeout,
         default_retries=default_retries,

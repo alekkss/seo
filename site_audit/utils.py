@@ -107,7 +107,10 @@ class AsyncResponse:
         status: HTTP-статус ответа (0 при ошибке сети).
         headers: заголовки ответа.
         text: тело ответа как строка (пустая при HEAD-запросе или ошибке).
-        content: тело ответа как байты (пустые при HEAD-запросе или ошибке).
+        content: тело ответа как байты (пустые при HEAD-запросе, ошибке,
+            или если вызывающий код явно отказался от байтов через
+            keep_raw_content=False в async_fetch — см. этот параметр
+            для экономии памяти при массовой загрузке страниц).
         final_url: URL после всех редиректов.
         error: описание ошибки (пустая строка, если запрос успешен).
         ok: True, если статус 200–399 и нет ошибки.
@@ -236,6 +239,7 @@ async def async_fetch(
     retry_delay: float = _DEFAULT_RETRY_DELAY,
     allow_redirects: bool = True,
     read_body: bool = True,
+    keep_raw_content: bool = True,
 ) -> AsyncResponse:
     """
     Асинхронный HTTP-запрос с повторами, ограничением параллельности
@@ -258,6 +262,12 @@ async def async_fetch(
         retry_delay: базовая задержка между попытками (секунды).
         allow_redirects: следовать ли за редиректами.
         read_body: читать ли тело ответа (False для HEAD-запросов).
+        keep_raw_content: сохранять ли сырые байты тела ответа в
+            AsyncResponse.content. По умолчанию True (полная обратная
+            совместимость). Установите False, если вызывающему коду
+            нужен только .text — это вдвое сокращает память на страницу
+            при массовой загрузке (используется в async_fetch_many для
+            загрузки HTML-страниц, где байты никогда не читаются).
 
     Returns:
         AsyncResponse с данными ответа.
@@ -363,12 +373,15 @@ async def async_fetch(
                             if proxy_url and proxy_rotator is not None:
                                 proxy_rotator.mark_success(proxy_url)
 
+                        # keep_raw_content=False — не сохраняем сырые байты
+                        # в результате, чтобы не удваивать память на страницу
+                        # (текст уже декодирован в body_text выше).
                         return AsyncResponse(
                             url=url,
                             status=resp.status,
                             headers=resp_headers,
                             text=body_text,
-                            content=body_bytes,
+                            content=body_bytes if keep_raw_content else b"",
                             final_url=final,
                             error="" if is_ok else f"HTTP {resp.status}",
                             ok=is_ok,
@@ -625,6 +638,7 @@ async def async_fetch_many(
     delay: float = 0.0,
     on_progress: Any | None = None,
     progress_every: int = 50,
+    keep_raw_content: bool = True,
 ) -> list[AsyncResponse]:
     """
     Массовая загрузка URL с ограничением параллельности, прогрессом
@@ -644,6 +658,11 @@ async def async_fetch_many(
         delay: задержка между запросами в секундах (для защиты от бана).
         on_progress: callback(message: str) для отправки прогресса.
         progress_every: как часто вызывать on_progress (каждые N запросов).
+        keep_raw_content: передаётся в async_fetch для каждого URL.
+            По умолчанию True (обратная совместимость). Вызывающий код,
+            которому нужен только .text (например, загрузка HTML-страниц
+            для проверок), должен передать False — это вдвое сократит
+            память на страницу при массовой загрузке.
 
     Returns:
         Список AsyncResponse в том же порядке, что и urls.
@@ -664,6 +683,7 @@ async def async_fetch_many(
                 proxy_rotator=proxy_rotator,
                 timeout=timeout,
                 retries=retries,
+                keep_raw_content=keep_raw_content,
             )
         except Exception as exc:
             # Защита от неожиданных исключений
