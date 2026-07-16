@@ -5,14 +5,23 @@
 Основной метод — run_audit_async (асинхронный).
 Синхронная обёртка run_audit сохранена для обратной совместимости.
 
+Архитектура потоковой обработки:
+    Страницы обрабатываются батчами по _STREAM_BATCH_SIZE (2000) URL:
+      1. Загружается батч HTML.
+      2. Per-page проверки (seo, empty, meta, heading, mixed, placeholders)
+         выполняются над батчем, результаты накапливаются.
+      3. Из батча извлекаются компактные метаданные для cross-page проверок
+         (title, description, h1, hash текста, внутренние ссылки).
+      4. HTML батча освобождается из памяти.
+      5. После всех батчей запускаются cross-page проверки (duplicates,
+         orphan_pages), работающие только с метаданными.
+    Это позволяет проверять сайты с 20 000+ страниц на VPS с 2 ГБ RAM.
+
 Архитектура параллельности:
     Уровень параллельности определяется ЕДИНЫМ семафором, значение которого
     вычисляется функцией compute_optimal_semaphore() из utils.py:
       - С прокси: proxy_count * max_connections_per_proxy
       - Без прокси: fallback_max_concurrent (= params.workers)
-    Этот семафор передаётся в async_fetch_many и в IO-bound проверки.
-    Семафоры прокси (per-proxy) НЕ используются — это исключает
-    двойную блокировку и deadlock'и.
 
 Использование:
     from site_audit.services import AuditService
@@ -21,16 +30,14 @@
     settings = get_settings()
     service = AuditService(settings)
 
-    # Асинхронный вызов
     result = await service.run_audit_async(params)
-
-    # Синхронный вызов (обёртка над asyncio.run)
-    result = service.run_audit(params)
 """
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -61,16 +68,41 @@ from site_audit.utils import (
     create_aiohttp_session,
     get_domain,
     is_async_response_ok,
+    normalize_url,
 )
 
 logger = get_logger("service.audit")
 
-# ── Проверки, которые выполняют свои HTTP-запросы (IO-bound, async) ────────
-# Эти проверки имеют async_check() и должны вызываться напрямую через await
-# в текущем event loop, чтобы семафоры работали корректно.
+# ── Классификация проверок ────────────────────────────────────────────────
+
+# Per-page проверки: обрабатывают каждую страницу независимо.
+# Запускаются на каждом батче, результаты накапливаются.
+_PER_PAGE_CHECKS: frozenset[str] = frozenset({
+    "empty_pages",
+    "seo",
+    "meta_quality",
+    "heading_structure",
+    "mixed_content",
+    "placeholders",
+})
+
+# IO-bound per-page проверки: делают свои HTTP-запросы,
+# вызываются через await в текущем event loop.
 _ASYNC_IO_CHECKS: frozenset[str] = frozenset({
     "broken_links",
     "images",
+})
+
+# Cross-page проверки: требуют данные со ВСЕХ страниц для сравнения.
+# Запускаются ОДИН РАЗ после обработки всех батчей,
+# работают с компактными метаданными, а не с HTML.
+_CROSS_PAGE_CHECKS: frozenset[str] = frozenset({
+    "duplicates",
+    "orphan_pages",
+})
+
+# Standalone проверки: не зависят от загруженных страниц.
+_STANDALONE_CHECKS: frozenset[str] = frozenset({
     "robots_sitemap",
 })
 
@@ -135,7 +167,6 @@ class AuditParams:
     max_depth: int = 3
     limit: int = 0
     workers: int = 20
-
     delay: float = 0.0
 
     # Опциональный предохранитель от переполнения памяти.
@@ -143,7 +174,7 @@ class AuditParams:
     # через DEFAULT_MAX_TOTAL_PAGES в .env, если сервер ограничен по памяти.
     max_total_pages: int = 0
 
-    # Сетевые настройки (увеличены для устойчивости к медленным серверам)
+    # Сетевые настройки
     timeout: int = 30
     retries: int = 3
 
@@ -169,6 +200,27 @@ class AuditResult:
     elapsed_seconds: float
 
 
+@dataclass
+class _CrossPageAccumulator:
+    """
+    Аккумулятор компактных метаданных для cross-page проверок.
+
+    Хранит только то, что нужно для duplicates и orphan_pages,
+    без полного HTML. Для 20 000 страниц занимает ~20 МБ.
+
+    Attributes:
+        page_infos: метаданные страниц для duplicates
+            (title, description, h1, canonical, text_hash, text_prefix_hash).
+        inbound_links: карта входящих ссылок для orphan_pages
+            {нормализованный_target_url: {source_url_1, ...}}.
+        all_urls: все URL в порядке обнаружения.
+    """
+
+    page_infos: list[dict[str, Any]] = field(default_factory=list)
+    inbound_links: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    all_urls: list[str] = field(default_factory=list)
+
+
 class AuditService:
     """
     Сервис выполнения полного цикла аудита сайта.
@@ -176,38 +228,30 @@ class AuditService:
     Принимает настройки через конструктор (Dependency Injection),
     не зависит от конкретной точки входа (CLI/бот).
 
-    При инициализации создаёт ProxyRotator из настроек —
-    один ротатор переиспользуется для всех запросов аудита,
-    включая проверки битых ссылок, картинок и robots.txt.
+    Потоковая обработка:
+      Страницы обрабатываются батчами по _STREAM_BATCH_SIZE URL.
+      В памяти одновременно находится только HTML одного батча +
+      компактный аккумулятор метаданных для cross-page проверок.
+      После обработки батча HTML освобождается, GC принудительно
+      запускается для возврата памяти ОС.
 
-    Параллельность определяется ЕДИНЫМ семафором:
-      - С прокси: proxy_count * max_connections_per_proxy
-      - Без прокси: params.workers
-    Вычисляется через compute_optimal_semaphore() из utils.py.
-    Семафоры прокси (per-proxy) не используются, что исключает
-    двойную блокировку и зависания.
-
-    IO-bound проверки (broken_links, images, robots_sitemap) выполняются
-    напрямую через await в текущем event loop.
-
-    CPU-bound проверки (seo, empty_pages, duplicates, placeholders,
-    mixed_content, meta_quality, heading_structure, orphan_pages)
-    выполняются в ThreadPoolExecutor через run_in_executor.
-
-    Основной метод — run_audit_async (асинхронный).
-    Метод run_audit — синхронная обёртка для удобства вызова.
+    Параллельность:
+      Определяется единым семафором: proxy_count * max_connections
+      или params.workers без прокси.
     """
 
-    # Размер одной порции при загрузке страниц (этап 2). Ограничивает
-    # количество одновременно находящихся "в полёте" задач. Задача батчинга —
-    # сгладить пиковую нагрузку и дать сборщику мусора Python шанс
-    # освободить промежуточные объекты между порциями.
-    _DOWNLOAD_BATCH_SIZE: int = 500
+    # Размер батча потоковой обработки. Определяет пиковое потребление
+    # памяти: ~2000 HTML-страниц ≈ 500 МБ–1 ГБ.
+    # Для VPS с 2 ГБ RAM — 2000, с 1 ГБ — 1000, с 4 ГБ — 4000.
+    _STREAM_BATCH_SIZE: int = 2000
+
+    # Размер порции внутри батча при загрузке через aiohttp.
+    # Ограничивает количество одновременно "в полёте" задач.
+    _DOWNLOAD_CHUNK_SIZE: int = 500
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._proxy_rotator: ProxyRotator | None = create_proxy_rotator()
-        # Сохраняется после сбора URL для использования в orphan_pages и robots_sitemap
         self._sitemap_urls: set[str] | None = None
 
     @property
@@ -217,37 +261,16 @@ class AuditService:
 
     @staticmethod
     def available_checks() -> dict[str, str]:
-        """
-        Возвращает словарь доступных проверок: {имя: описание}.
-
-        Returns:
-            Словарь с именами и описаниями проверок.
-        """
+        """Возвращает словарь доступных проверок: {имя: описание}."""
         return {name: entry["description"] for name, entry in ALL_CHECKS.items()}
 
     @staticmethod
     def validate_check_names(names: list[str]) -> list[str]:
-        """
-        Проверяет корректность имён проверок.
-
-        Args:
-            names: список имён для валидации.
-
-        Returns:
-            Список некорректных имён (пустой, если всё верно).
-        """
+        """Возвращает список некорректных имён проверок."""
         return [n for n in names if n not in ALL_CHECKS]
 
     def create_params_from_settings(self, base_url: str) -> AuditParams:
-        """
-        Создаёт AuditParams из настроек .env.
-
-        Args:
-            base_url: URL сайта для аудита.
-
-        Returns:
-            Объект AuditParams с параметрами из конфигурации.
-        """
+        """Создаёт AuditParams из настроек .env."""
         s = self._settings
         return AuditParams(
             base_url=base_url,
@@ -272,25 +295,14 @@ class AuditService:
     # ═════════════════════════════════════════════════════════════════════
 
     def _compute_semaphore_value(self, params: AuditParams) -> int:
-        """
-        Вычисляет значение общего семафора для HTTP-запросов.
-
-        С прокси: proxy_count * max_connections_per_proxy.
-        Без прокси: params.workers.
-
-        Args:
-            params: параметры аудита.
-
-        Returns:
-            Значение для asyncio.Semaphore.
-        """
+        """Вычисляет значение общего семафора для HTTP-запросов."""
         return compute_optimal_semaphore(
             proxy_rotator=self._proxy_rotator,
             fallback_max_concurrent=params.workers,
         )
 
     # ═════════════════════════════════════════════════════════════════════
-    # Синхронная обёртка (для CLI и обратной совместимости)
+    # Синхронная обёртка
     # ═════════════════════════════════════════════════════════════════════
 
     def run_audit(
@@ -299,21 +311,7 @@ class AuditService:
         *,
         on_progress: Callable[[str], None] | None = None,
     ) -> AuditResult:
-        """
-        Синхронная обёртка над run_audit_async.
-        Создаёт новый event loop и запускает асинхронный аудит.
-        Используется из CLI и других синхронных контекстов.
-
-        Args:
-            params: параметры аудита.
-            on_progress: callback для прогресса.
-
-        Returns:
-            Объект AuditResult.
-
-        Raises:
-            ValueError: если URL пуст или проверки не найдены.
-        """
+        """Синхронная обёртка над run_audit_async."""
         return asyncio.run(self.run_audit_async(params, on_progress=on_progress))
 
     # ═════════════════════════════════════════════════════════════════════
@@ -328,22 +326,29 @@ class AuditService:
     ) -> AuditResult:
         """
         Запускает полный цикл аудита асинхронно.
-        Этапы:
-          0. Preflight-проверка прокси с целевым сайтом — async
-          1. Сбор URL (sitemap / BFS-обход) — async
-          2. Загрузка страниц (aiohttp + семафор) — async
-          3. Проверки — IO-bound через await, CPU-bound в executor
-          4. Генерация отчётов — в executor (IO-bound файловые операции)
+
+        Потоковая обработка:
+          0. Preflight-проверка прокси
+          1. Сбор URL (sitemap / BFS)
+          2. Для каждого батча из _STREAM_BATCH_SIZE URL:
+             a. Загрузка HTML
+             b. Per-page проверки (seo, empty, meta, heading, ...)
+             c. IO-bound проверки (broken_links, images)
+             d. Извлечение метаданных для cross-page проверок
+             e. Освобождение HTML из памяти
+          3. Cross-page проверки (duplicates, orphan_pages) по метаданным
+          4. Standalone проверки (robots_sitemap)
+          5. Генерация отчётов
 
         Args:
             params: параметры аудита.
-            on_progress: callback для отправки сообщений о прогрессе.
+            on_progress: callback для прогресса.
 
         Returns:
-            Объект AuditResult с результатами аудита и путями к отчётам.
+            AuditResult с результатами.
 
         Raises:
-            ValueError: если URL пуст или не найдено ни одного URL.
+            ValueError: если не найдено ни одного URL.
         """
         trace_id = set_trace_id()
         start_time = time.time()
@@ -352,7 +357,7 @@ class AuditService:
         if not base_url.startswith("http"):
             base_url = "https://" + base_url
 
-        # Логируем информацию о прокси при старте аудита
+        # Логируем старт
         if self._proxy_rotator is not None and self._proxy_rotator.is_enabled:
             logger.info(
                 "Аудит запущен с прокси",
@@ -375,7 +380,7 @@ class AuditService:
             )
             self._notify(on_progress, f"🔍 Начинаю аудит: {base_url}")
 
-        # ── 0. Preflight-проверка прокси ──────────────────────────
+        # ── 0. Preflight ──────────────────────────────────────────
         await self._run_preflight(base_url, params, on_progress)
 
         # ── 1. Сбор URL ──────────────────────────────────────────
@@ -396,36 +401,282 @@ class AuditService:
             }},
         )
 
-        # ── 2. Загрузка страниц ──────────────────────────────────
+        # ── 2–3. Потоковая обработка батчами ─────────────────────
         semaphore_value = self._compute_semaphore_value(params)
+        total_batches = (len(urls) + self._STREAM_BATCH_SIZE - 1) // self._STREAM_BATCH_SIZE
+
         self._notify(
             on_progress,
-            f"⬇️ Этап 2/4: Загрузка {len(urls)} страниц "
-            f"(параллельность: {semaphore_value})...",
-        )
-        pages = await self._download_pages_async(
-            urls, params, semaphore_value, on_progress,
-        )
-        ok_count = sum(1 for p in pages if p["html"] is not None)
-        self._notify(on_progress, f"⬇️ Загружено с HTML: {ok_count}/{len(urls)}")
-        logger.info(
-            "Страницы загружены",
-            extra={"context": {"total": len(urls), "with_html": ok_count}},
+            f"⬇️ Этап 2/4: Загрузка и проверка {len(urls)} страниц "
+            f"({total_batches} батч(ей) по {self._STREAM_BATCH_SIZE}, "
+            f"параллельность: {semaphore_value})...",
         )
 
-        # ── 3. Проверки ──────────────────────────────────────────
+        results: dict[str, list[dict[str, Any]]] = {}
+        accumulator = _CrossPageAccumulator(all_urls=list(urls))
+
+        # Определяем, какие per-page и IO проверки нужны
+        active_per_page = [n for n in params.check_names if n in _PER_PAGE_CHECKS]
+        active_io = [n for n in params.check_names if n in _ASYNC_IO_CHECKS]
+        active_cross = [n for n in params.check_names if n in _CROSS_PAGE_CHECKS]
+        active_standalone = [n for n in params.check_names if n in _STANDALONE_CHECKS]
+
+        # Нужно ли собирать метаданные для cross-page проверок?
+        need_dup_meta = "duplicates" in active_cross
+        need_orphan_meta = "orphan_pages" in active_cross
+
+        total_ok = 0
+        total_done = 0
+
+        for batch_index in range(total_batches):
+            batch_start = batch_index * self._STREAM_BATCH_SIZE
+            batch_urls = urls[batch_start: batch_start + self._STREAM_BATCH_SIZE]
+            batch_num = batch_index + 1
+
+            self._notify(
+                on_progress,
+                f"⬇️ Батч {batch_num}/{total_batches}: "
+                f"загрузка {len(batch_urls)} страниц...",
+            )
+
+            # ── 2a. Загрузка HTML батча ───────────────────────────
+            pages = await self._download_pages_async(
+                batch_urls, params, semaphore_value, on_progress,
+            )
+            ok_count = sum(1 for p in pages if p["html"] is not None)
+            total_ok += ok_count
+            total_done += len(batch_urls)
+
+            logger.info(
+                "Батч загружен",
+                extra={"context": {
+                    "batch": batch_num,
+                    "total_batches": total_batches,
+                    "urls": len(batch_urls),
+                    "with_html": ok_count,
+                }},
+            )
+
+            # ── 2b. Конвертируем для совместимости с проверками ───
+            compatible_pages = _make_compatible_pages(pages)
+
+            # ── 2c. Per-page проверки (CPU-bound) ─────────────────
+            loop = asyncio.get_running_loop()
+            for name in active_per_page:
+                entry = ALL_CHECKS[name]
+                mod = entry["module"]
+
+                t0 = time.time()
+                try:
+                    res = await loop.run_in_executor(
+                        None,
+                        partial(
+                            self._execute_sync_check,
+                            name, mod, compatible_pages, batch_urls,
+                            get_domain(base_url), params, base_url,
+                            self._sitemap_urls,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Ошибка в per-page проверке",
+                        extra={"context": {
+                            "check": name,
+                            "batch": batch_num,
+                            "error": str(exc),
+                        }},
+                        exc_info=True,
+                    )
+                    res = []
+
+                results.setdefault(name, []).extend(res)
+                elapsed_check = time.time() - t0
+                logger.debug(
+                    "Per-page проверка завершена",
+                    extra={"context": {
+                        "check": name,
+                        "batch": batch_num,
+                        "issues": len(res),
+                        "elapsed": round(elapsed_check, 1),
+                    }},
+                )
+
+            # ── 2d. IO-bound проверки (broken_links, images) ─────
+            for name in active_io:
+                entry = ALL_CHECKS[name]
+                mod = entry["module"]
+
+                t0 = time.time()
+                try:
+                    res = await self._execute_async_check(
+                        name, mod, compatible_pages, params,
+                        semaphore_value, base_url,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Ошибка в IO-bound проверке",
+                        extra={"context": {
+                            "check": name,
+                            "batch": batch_num,
+                            "error": str(exc),
+                        }},
+                        exc_info=True,
+                    )
+                    res = []
+
+                results.setdefault(name, []).extend(res)
+                elapsed_check = time.time() - t0
+                logger.debug(
+                    "IO-bound проверка завершена",
+                    extra={"context": {
+                        "check": name,
+                        "batch": batch_num,
+                        "issues": len(res),
+                        "elapsed": round(elapsed_check, 1),
+                    }},
+                )
+
+            # ── 2e. Извлечение метаданных для cross-page ─────────
+            if need_dup_meta:
+                self._extract_dup_metadata(compatible_pages, accumulator)
+
+            if need_orphan_meta:
+                self._extract_orphan_metadata(compatible_pages, accumulator)
+
+            # ── 2f. Освобождение HTML ─────────────────────────────
+            del pages
+            del compatible_pages
+            gc.collect()
+
+            self._notify(
+                on_progress,
+                f"⬇️ Батч {batch_num}/{total_batches} обработан. "
+                f"Загружено с HTML: {total_ok}/{total_done}",
+            )
+
         self._notify(
             on_progress,
-            f"🔎 Этап 3/4: Проверки ({len(params.check_names)} шт.)...",
+            f"⬇️ Все страницы обработаны: {total_ok}/{len(urls)} с HTML",
         )
-        results, summaries = await self._run_checks_async(
-            base_url, urls, pages, params, semaphore_value, on_progress,
-        )
+
+        # ── 3. Cross-page проверки (по метаданным) ────────────────
+        if active_cross:
+            self._notify(
+                on_progress,
+                f"🔎 Этап 3/4: Cross-page проверки "
+                f"({len(active_cross)} шт.)...",
+            )
+
+            loop = asyncio.get_running_loop()
+            for name in active_cross:
+                entry = ALL_CHECKS[name]
+                mod = entry["module"]
+                description = entry["description"]
+
+                self._notify(on_progress, f"🔎 {description}...")
+                logger.info(
+                    "Запуск cross-page проверки",
+                    extra={"context": {"check": name}},
+                )
+
+                t0 = time.time()
+                try:
+                    if name == "duplicates":
+                        res = await loop.run_in_executor(
+                            None,
+                            partial(
+                                self._run_duplicates_from_metadata,
+                                accumulator,
+                            ),
+                        )
+                    elif name == "orphan_pages":
+                        res = await loop.run_in_executor(
+                            None,
+                            partial(
+                                self._run_orphan_from_metadata,
+                                accumulator, base_url,
+                            ),
+                        )
+                    else:
+                        res = []
+                except Exception as exc:
+                    logger.error(
+                        "Ошибка в cross-page проверке",
+                        extra={"context": {"check": name, "error": str(exc)}},
+                        exc_info=True,
+                    )
+                    res = []
+
+                results[name] = res
+                elapsed_check = time.time() - t0
+                logger.info(
+                    "Cross-page проверка завершена",
+                    extra={"context": {
+                        "check": name,
+                        "issues": len(res),
+                        "elapsed": round(elapsed_check, 1),
+                    }},
+                )
+
+        # ── 3b. Standalone проверки (robots_sitemap) ─────────────
+        if active_standalone:
+            for name in active_standalone:
+                entry = ALL_CHECKS[name]
+                mod = entry["module"]
+                description = entry["description"]
+
+                self._notify(on_progress, f"🔎 {description}...")
+                logger.info(
+                    "Запуск standalone проверки",
+                    extra={"context": {"check": name}},
+                )
+
+                t0 = time.time()
+                try:
+                    if name == "robots_sitemap":
+                        res = await mod.async_check(
+                            [],
+                            base_url=base_url,
+                            sitemap_urls=self._sitemap_urls,
+                            proxy_rotator=self._proxy_rotator,
+                            timeout=params.timeout,
+                        )
+                    else:
+                        res = []
+                except Exception as exc:
+                    logger.error(
+                        "Ошибка в standalone проверке",
+                        extra={"context": {"check": name, "error": str(exc)}},
+                        exc_info=True,
+                    )
+                    res = []
+
+                results[name] = res
+                elapsed_check = time.time() - t0
+                logger.info(
+                    "Standalone проверка завершена",
+                    extra={"context": {
+                        "check": name,
+                        "issues": len(res),
+                        "elapsed": round(elapsed_check, 1),
+                    }},
+                )
+
+        # Освобождаем аккумулятор
+        del accumulator
+        gc.collect()
+
+        # ── Сводки ────────────────────────────────────────────────
+        summaries: dict[str, str] = {}
+        for name in params.check_names:
+            if name in ALL_CHECKS and name in results:
+                mod = ALL_CHECKS[name]["module"]
+                summaries[name] = mod.summary(results[name])
+
         total_issues = sum(len(rows) for rows in results.values())
-        self._notify(on_progress, f"🔎 Проверки завершены. Проблем: {total_issues}")
-        logger.info(
-            "Проверки завершены",
-            extra={"context": {"total_issues": total_issues}},
+        self._notify(
+            on_progress,
+            f"🔎 Проверки завершены. Проблем: {total_issues}",
         )
 
         # ── 4. Отчёты ────────────────────────────────────────────
@@ -466,7 +717,7 @@ class AuditService:
         )
 
     # ═════════════════════════════════════════════════════════════════════
-    # Этап 0: Preflight-проверка прокси
+    # Этап 0: Preflight
     # ═════════════════════════════════════════════════════════════════════
 
     async def _run_preflight(
@@ -475,19 +726,7 @@ class AuditService:
         params: AuditParams,
         on_progress: Callable[[str], None] | None = None,
     ) -> None:
-        """
-        Выполняет preflight-проверку прокси с целевым сайтом.
-
-        Если прокси не настроены или отключены — пропускает.
-        Если часть прокси прошла проверку — логирует и продолжает.
-        Если ни один прокси не прошёл — отключает прокси и
-        продолжает аудит напрямую (graceful degradation).
-
-        Args:
-            base_url: URL целевого сайта.
-            params: параметры аудита (используется timeout).
-            on_progress: callback для прогресса.
-        """
+        """Выполняет preflight-проверку прокси с целевым сайтом."""
         if self._proxy_rotator is None or not self._proxy_rotator.is_enabled:
             return
 
@@ -496,9 +735,7 @@ class AuditService:
             f"🔌 Проверка прокси с сайтом {base_url}...",
         )
 
-        # Таймаут preflight чуть меньше основного — это быстрая проверка
         preflight_timeout = min(params.timeout, 15)
-
         result: PreflightResult = await self._proxy_rotator.preflight_check(
             base_url,
             timeout=preflight_timeout,
@@ -508,7 +745,6 @@ class AuditService:
             return
 
         if result.all_failed:
-            # Ни один прокси не работает с этим сайтом — отключаем прокси
             self._proxy_rotator = None
             self._notify(
                 on_progress,
@@ -538,7 +774,7 @@ class AuditService:
             )
 
     # ═════════════════════════════════════════════════════════════════════
-    # Этап 1: Сбор URL (async)
+    # Этап 1: Сбор URL
     # ═════════════════════════════════════════════════════════════════════
 
     async def _collect_urls_async(
@@ -546,24 +782,7 @@ class AuditService:
         base_url: str,
         params: AuditParams,
     ) -> list[str]:
-        """
-        Асинхронно собирает URL через sitemap или BFS-обход.
-        Передаёт ProxyRotator для выполнения запросов через прокси.
-        Сохраняет полный набор URL из sitemap в self._sitemap_urls
-        до применения limit — для использования в orphan_pages и robots_sitemap.
-
-        Применяет два независимых ограничения к итоговому списку:
-          1. params.limit — если задан явно (> 0), обрезает список.
-          2. params.max_total_pages — если задан явно (> 0), обрезает список.
-             Значение 0 означает «без лимита» — предохранитель отключён.
-
-        Args:
-            base_url: корневой URL сайта.
-            params: параметры аудита.
-
-        Returns:
-            Список URL для проверки.
-        """
+        """Асинхронно собирает URL через sitemap или BFS-обход."""
         urls_set = await async_try_sitemap(
             base_url,
             timeout=params.timeout,
@@ -573,7 +792,6 @@ class AuditService:
         )
 
         if urls_set:
-            # Сохраняем полный набор URL из sitemap до применения limit
             self._sitemap_urls = set(urls_set)
             logger.info(
                 "URL получены из sitemap",
@@ -581,7 +799,6 @@ class AuditService:
             )
             urls = list(urls_set)
         else:
-            # BFS-обход: sitemap отсутствует
             self._sitemap_urls = None
             logger.info("Sitemap не найден, запускаю BFS-обход")
             urls = await async_crawl(
@@ -596,13 +813,9 @@ class AuditService:
                 verbose=False,
             )
 
-        # Пользовательский лимит (--limit N)
         if params.limit > 0:
             urls = urls[: params.limit]
 
-        # Опциональный предохранитель от переполнения памяти.
-        # Срабатывает ТОЛЬКО если max_total_pages > 0 (явно задан).
-        # Значение 0 означает «без лимита» — предохранитель отключён.
         if params.max_total_pages > 0 and len(urls) > params.max_total_pages:
             logger.warning(
                 "Превышен лимит max_total_pages, список URL обрезан",
@@ -616,7 +829,7 @@ class AuditService:
         return urls
 
     # ═════════════════════════════════════════════════════════════════════
-    # Этап 2: Загрузка страниц (async)
+    # Этап 2: Загрузка страниц батча
     # ═════════════════════════════════════════════════════════════════════
 
     async def _download_pages_async(
@@ -626,30 +839,8 @@ class AuditService:
         semaphore_value: int,
         on_progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Асинхронно загружает HTML всех URL через aiohttp.
-
-        Уровень параллельности определяется единым семафором,
-        значение которого вычислено в _compute_semaphore_value:
-          - С прокси: proxy_count * max_connections_per_proxy
-          - Без прокси: params.workers
-
-        Загружает URL порциями по _DOWNLOAD_BATCH_SIZE штук:
-        это ограничивает пиковое количество задач "в полёте"
-        и даёт сборщику мусора освободить объекты между порциями.
-
-        Args:
-            urls: список URL для загрузки.
-            params: параметры аудита (timeout, retries, delay).
-            semaphore_value: значение общего семафора параллельности.
-            on_progress: callback для прогресса.
-
-        Returns:
-            Список словарей {"url", "resp", "html"} для каждого URL.
-        """
+        """Асинхронно загружает HTML для одного батча URL."""
         semaphore = asyncio.Semaphore(semaphore_value)
-
-        # Лимит коннектора = семафор + запас на DNS/handshake
         connector_limit = semaphore_value + 20
         session = create_aiohttp_session(
             max_concurrent=connector_limit,
@@ -663,11 +854,11 @@ class AuditService:
         done = 0
 
         try:
-            for batch_start in range(0, total, self._DOWNLOAD_BATCH_SIZE):
-                batch_urls = urls[batch_start: batch_start + self._DOWNLOAD_BATCH_SIZE]
+            for chunk_start in range(0, total, self._DOWNLOAD_CHUNK_SIZE):
+                chunk_urls = urls[chunk_start: chunk_start + self._DOWNLOAD_CHUNK_SIZE]
 
                 responses = await async_fetch_many(
-                    batch_urls,
+                    chunk_urls,
                     session=session,
                     semaphore=semaphore,
                     proxy_rotator=self._proxy_rotator,
@@ -687,121 +878,264 @@ class AuditService:
                         "html": html,
                     })
 
-                done += len(batch_urls)
-                self._notify(on_progress, f"⬇️ Загружено {done}/{total}...")
+                done += len(chunk_urls)
                 logger.debug(
-                    "Порция страниц загружена",
+                    "Chunk загружен",
                     extra={"context": {"done": done, "total": total}},
                 )
         finally:
             await session.close()
-            logger.info(
-                "Aiohttp-сессия загрузки закрыта",
-                extra={"context": {"total_urls": len(urls)}},
-            )
 
         return pages
 
     # ═════════════════════════════════════════════════════════════════════
-    # Этап 3: Проверки
+    # Извлечение метаданных для cross-page проверок
     # ═════════════════════════════════════════════════════════════════════
 
-    async def _run_checks_async(
-        self,
-        base_url: str,
-        urls: list[str],
+    @staticmethod
+    def _extract_dup_metadata(
         pages: list[dict[str, Any]],
-        params: AuditParams,
-        semaphore_value: int,
-        on_progress: Callable[[str], None] | None = None,
-    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+        accumulator: _CrossPageAccumulator,
+    ) -> None:
         """
-        Выполняет выбранные проверки над загруженными страницами.
-
-        Два режима выполнения:
-          - IO-bound проверки (broken_links, images, robots_sitemap) —
-            вызываются напрямую через await в текущем event loop.
-            Используют тот же семафор, что и загрузка страниц.
-          - CPU-bound проверки (остальные) — запускаются в
-            ThreadPoolExecutor через run_in_executor.
+        Извлекает компактные метаданные из батча для проверки duplicates.
+        Вызывает duplicates._extract_page_info для каждой страницы
+        и сохраняет результат в аккумулятор. HTML не сохраняется.
 
         Args:
-            base_url: корневой URL сайта.
-            urls: список проверяемых URL.
-            pages: загруженные страницы.
-            params: параметры аудита.
-            semaphore_value: значение общего семафора для IO-проверок.
-            on_progress: callback для прогресса.
-
-        Returns:
-            Кортеж (results, summaries).
+            pages: страницы батча в совместимом формате.
+            accumulator: аккумулятор метаданных.
         """
-        results: dict[str, list[dict[str, Any]]] = {}
-        summaries: dict[str, str] = {}
-        domain = get_domain(base_url)
+        for page in pages:
+            info = duplicates._extract_page_info(
+                page["url"],
+                resp=page.get("resp"),
+                html=page.get("html"),
+            )
+            if info is not None:
+                # Удаляем полный текст — оставляем только хеши и метаданные
+                info.pop("text", None)
+                accumulator.page_infos.append(info)
 
-        loop = asyncio.get_running_loop()
-        compatible_pages = _make_compatible_pages(pages)
+    @staticmethod
+    def _extract_orphan_metadata(
+        pages: list[dict[str, Any]],
+        accumulator: _CrossPageAccumulator,
+    ) -> None:
+        """
+        Извлекает внутренние ссылки из батча для проверки orphan_pages.
+        Строит карту входящих ссылок: target_url → {source_url, ...}.
 
-        for name in params.check_names:
-            if name not in ALL_CHECKS:
-                logger.warning(
-                    "Неизвестная проверка, пропускаю",
-                    extra={"context": {"check": name}},
-                )
+        Args:
+            pages: страницы батча в совместимом формате.
+            accumulator: аккумулятор метаданных.
+        """
+        from site_audit.crawler import extract_links
+        from site_audit.utils import is_html_response as _is_html
+
+        for page in pages:
+            url = page["url"]
+            html = page.get("html")
+
+            if html is None:
+                resp = page.get("resp")
+                if resp is None or isinstance(resp, Exception):
+                    continue
+                if isinstance(resp, AsyncResponse):
+                    if not resp.ok or resp.status != 200 or not _is_html(resp):
+                        continue
+                    html = resp.text
+                else:
+                    if not _is_html(resp):
+                        continue
+                    html = resp.text
+
+            try:
+                links = extract_links(html, url)
+            except Exception:
                 continue
 
-            entry = ALL_CHECKS[name]
-            mod = entry["module"]
-            description = entry["description"]
+            for link in links["internal"]:
+                norm = normalize_url(link)
+                accumulator.inbound_links[norm].add(url)
 
-            logger.info(
-                "Запуск проверки",
-                extra={"context": {"check": name, "description": description}},
-            )
+    # ═════════════════════════════════════════════════════════════════════
+    # Cross-page проверки (работают с метаданными)
+    # ═════════════════════════════════════════════════════════════════════
 
-            self._notify(on_progress, f"🔎 {description}...")
+    @staticmethod
+    def _run_duplicates_from_metadata(
+        accumulator: _CrossPageAccumulator,
+    ) -> list[dict[str, Any]]:
+        """
+        Запускает проверку дубликатов на основе собранных метаданных.
+        Вместо полного HTML использует уже извлечённые title, description,
+        h1, canonical, text_hash, text_prefix_hash.
 
-            t0 = time.time()
-            try:
-                if name in _ASYNC_IO_CHECKS:
-                    # IO-bound: вызываем async_check напрямую в текущем loop
-                    res = await self._execute_async_check(
-                        name, mod, compatible_pages, params,
-                        semaphore_value, base_url,
-                    )
-                else:
-                    # CPU-bound: выносим в executor, чтобы не блокировать loop
-                    res = await loop.run_in_executor(
-                        None,
-                        partial(
-                            self._execute_sync_check,
-                            name, mod, compatible_pages, urls, domain,
-                            params, base_url, self._sitemap_urls,
-                        ),
-                    )
-            except Exception as exc:
-                logger.error(
-                    "Ошибка в проверке",
-                    extra={"context": {"check": name, "error": str(exc)}},
-                    exc_info=True,
-                )
-                res = []
+        Args:
+            accumulator: аккумулятор с page_infos.
 
-            elapsed_check = time.time() - t0
-            results[name] = res
-            summaries[name] = mod.summary(res)
+        Returns:
+            Список найденных дубликатов.
+        """
+        infos = accumulator.page_infos
+        if not infos:
+            return []
 
-            logger.info(
-                "Проверка завершена",
-                extra={"context": {
-                    "check": name,
-                    "issues": len(res),
-                    "elapsed": round(elapsed_check, 1),
-                }},
-            )
+        results: list[dict[str, Any]] = []
 
-        return results, summaries
+        # Дубли title
+        dup_title = duplicates._find_duplicates(infos, "title", min_length=3)
+        for value, urls in dup_title.items():
+            results.append({
+                "check": duplicates.CHECK_NAME,
+                "dup_type": "title",
+                "value": value,
+                "urls": urls,
+                "count": len(urls),
+            })
+
+        # Дубли description
+        dup_desc = duplicates._find_duplicates(infos, "description", min_length=10)
+        for value, urls in dup_desc.items():
+            results.append({
+                "check": duplicates.CHECK_NAME,
+                "dup_type": "description",
+                "value": value,
+                "urls": urls,
+                "count": len(urls),
+            })
+
+        # Дубли H1
+        dup_h1 = duplicates._find_duplicates(infos, "h1", min_length=3)
+        for value, urls in dup_h1.items():
+            results.append({
+                "check": duplicates.CHECK_NAME,
+                "dup_type": "h1",
+                "value": value,
+                "urls": urls,
+                "count": len(urls),
+            })
+
+        # Полные дубли контента
+        dup_content = duplicates._find_duplicates(infos, "text_hash", min_length=32)
+        for hash_val, urls in dup_content.items():
+            results.append({
+                "check": duplicates.CHECK_NAME,
+                "dup_type": "content",
+                "value": f"[hash: {hash_val}]",
+                "urls": urls,
+                "count": len(urls),
+            })
+
+        # Near-дубли
+        dup_near = duplicates._find_duplicates(
+            infos, "text_prefix_hash", min_length=32,
+        )
+        for hash_val, urls in dup_near.items():
+            if hash_val in dup_content:
+                continue
+            full_hashes = set()
+            for info in infos:
+                if info["text_prefix_hash"] == hash_val:
+                    full_hashes.add(info["text_hash"])
+            if len(full_hashes) == 1 and full_hashes.pop() in dup_content:
+                continue
+            results.append({
+                "check": duplicates.CHECK_NAME,
+                "dup_type": "near_content",
+                "value": f"[prefix hash: {hash_val}]",
+                "urls": urls,
+                "count": len(urls),
+            })
+
+        # Одинаковый canonical
+        canon_groups: dict[str, list[str]] = defaultdict(list)
+        for info in infos:
+            canon = info.get("canonical", "")
+            url = info["url"]
+            if canon and normalize_url(canon) != normalize_url(url):
+                canon_groups[normalize_url(canon)].append(url)
+        for canon_val, urls in canon_groups.items():
+            if len(urls) >= 2:
+                results.append({
+                    "check": duplicates.CHECK_NAME,
+                    "dup_type": "canonical",
+                    "value": canon_val,
+                    "urls": urls,
+                    "count": len(urls),
+                })
+
+        logger.info(
+            "Duplicates из метаданных",
+            extra={"context": {
+                "total_infos": len(infos),
+                "groups_found": len(results),
+            }},
+        )
+
+        return results
+
+    @staticmethod
+    def _run_orphan_from_metadata(
+        accumulator: _CrossPageAccumulator,
+        base_url: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Находит страницы-сироты на основе собранной карты ссылок.
+
+        Args:
+            accumulator: аккумулятор с inbound_links и all_urls.
+            base_url: корневой URL сайта.
+
+        Returns:
+            Список страниц-сирот.
+        """
+        inbound = accumulator.inbound_links
+        all_urls = accumulator.all_urls
+
+        # Нормализуем все URL
+        norm_check_urls: dict[str, str] = {}
+        for url in all_urls:
+            norm = normalize_url(url)
+            if norm not in norm_check_urls:
+                norm_check_urls[norm] = url
+
+        # Исключаем главную
+        excluded_norms: set[str] = set()
+        if base_url:
+            excluded_norms.add(normalize_url(base_url))
+            excluded_norms.add(normalize_url(base_url.rstrip("/") + "/"))
+
+        results: list[dict[str, Any]] = []
+        for norm_url, original_url in norm_check_urls.items():
+            if norm_url in excluded_norms:
+                continue
+            sources = inbound.get(norm_url, set())
+            if sources:
+                continue
+
+            results.append({
+                "check": orphan_pages.CHECK_NAME,
+                "url": original_url,
+                "inbound_links": 0,
+                "in_sitemap": None,
+                "message": "Нет входящих внутренних ссылок",
+            })
+
+        logger.info(
+            "Orphan pages из метаданных",
+            extra={"context": {
+                "total_urls": len(all_urls),
+                "orphans_found": len(results),
+            }},
+        )
+
+        return results
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Per-page и IO-bound проверки
+    # ═════════════════════════════════════════════════════════════════════
 
     async def _execute_async_check(
         self,
@@ -812,23 +1146,7 @@ class AuditService:
         semaphore_value: int,
         base_url: str,
     ) -> list[dict[str, Any]]:
-        """
-        Выполняет IO-bound проверку напрямую через await в текущем event loop.
-
-        Используется тот же уровень параллельности (semaphore_value),
-        что и при загрузке страниц — он вычислен на основе пула прокси.
-
-        Args:
-            name: имя проверки.
-            mod: модуль проверки.
-            pages: загруженные страницы в совместимом формате.
-            params: параметры аудита.
-            semaphore_value: значение семафора для HTTP-запросов.
-            base_url: корневой URL сайта.
-
-        Returns:
-            Список найденных проблем.
-        """
+        """Выполняет IO-bound проверку через await в текущем event loop."""
         max_concurrent = max(semaphore_value, 1)
 
         if name == "broken_links":
@@ -849,15 +1167,6 @@ class AuditService:
                 proxy_rotator=self._proxy_rotator,
             )
 
-        if name == "robots_sitemap":
-            return await mod.async_check(
-                pages,
-                base_url=base_url,
-                sitemap_urls=self._sitemap_urls,
-                proxy_rotator=self._proxy_rotator,
-                timeout=params.timeout,
-            )
-
         return []
 
     @staticmethod
@@ -871,25 +1180,7 @@ class AuditService:
         base_url: str,
         sitemap_urls: set[str] | None,
     ) -> list[dict[str, Any]]:
-        """
-        Выполняет CPU-bound проверку синхронно.
-        Вызывается из executor (отдельного потока).
-        Эти проверки не делают HTTP-запросов — работают только
-        с уже загруженным HTML, поэтому не нуждаются в прокси.
-
-        Args:
-            name: имя проверки.
-            mod: модуль проверки.
-            pages: загруженные страницы в совместимом формате.
-            urls: список URL.
-            domain: домен сайта.
-            params: параметры аудита.
-            base_url: корневой URL сайта.
-            sitemap_urls: множество URL из sitemap (или None).
-
-        Returns:
-            Список найденных проблем.
-        """
+        """Выполняет CPU-bound per-page проверку синхронно в executor."""
         if name == "empty_pages":
             res = mod.check_many(
                 pages,
@@ -900,9 +1191,6 @@ class AuditService:
         if name == "seo":
             res = mod.check_many(pages)
             return mod.filter_with_issues(res)
-
-        if name == "duplicates":
-            return mod.check(pages, verbose=False)
 
         if name == "placeholders":
             return mod.check_many(pages, verbose=False)
@@ -915,15 +1203,6 @@ class AuditService:
 
         if name == "heading_structure":
             return mod.check_many(pages, verbose=False)
-
-        if name == "orphan_pages":
-            return mod.check(
-                pages,
-                all_urls=urls,
-                sitemap_urls=sitemap_urls,
-                base_url=base_url,
-                verbose=False,
-            )
 
         return []
 
@@ -938,18 +1217,7 @@ class AuditService:
         base_url: str,
         params: AuditParams,
     ) -> tuple[str, str]:
-        """
-        Генерирует Excel и HTML отчёты, возвращает пути к файлам.
-
-        Args:
-            results: результаты проверок.
-            summaries: текстовые сводки проверок.
-            base_url: URL сайта.
-            params: параметры аудита.
-
-        Returns:
-            Кортеж (excel_path, html_path).
-        """
+        """Генерирует Excel и HTML отчёты."""
         output_dir = Path(params.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -978,7 +1246,7 @@ class AuditService:
 
     @staticmethod
     def _notify(callback: Callable[[str], None] | None, message: str) -> None:
-        """Отправляет сообщение о прогрессе через callback, если он задан."""
+        """Отправляет сообщение о прогрессе через callback."""
         if callback is not None:
             callback(message)
 
@@ -993,21 +1261,6 @@ def _make_compatible_pages(
     """
     Конвертирует страницы с AsyncResponse в формат,
     совместимый с существующими модулями проверок.
-    Проверки ожидают:
-       - page["html"] — строка HTML или None
-       - page["resp"] — объект с атрибутами status_code, headers, text, url
-         (или None / Exception)
-    AsyncResponse уже имеет status_code (через property), headers (dict),
-    text и url — поэтому он совместим с проверками, которые используют
-    resp.status_code, resp.headers.get(...), resp.text, resp.url.
-    Для проверок, которые проверяют isinstance(resp, Exception),
-    создаём Exception из resp.error при наличии ошибки.
-
-    Args:
-        pages: список страниц с AsyncResponse.
-
-    Returns:
-        Список страниц в совместимом формате.
     """
     compatible: list[dict[str, Any]] = []
     for page in pages:
