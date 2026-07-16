@@ -5,6 +5,15 @@
 Основной метод — run_audit_async (асинхронный).
 Синхронная обёртка run_audit сохранена для обратной совместимости.
 
+Архитектура параллельности:
+    Уровень параллельности определяется ЕДИНЫМ семафором, значение которого
+    вычисляется функцией compute_optimal_semaphore() из utils.py:
+      - С прокси: proxy_count * max_connections_per_proxy
+      - Без прокси: fallback_max_concurrent (= params.workers)
+    Этот семафор передаётся в async_fetch_many и в IO-bound проверки.
+    Семафоры прокси (per-proxy) НЕ используются — это исключает
+    двойную блокировку и deadlock'и.
+
 Использование:
     from site_audit.services import AuditService
     from site_audit.config import get_settings
@@ -48,6 +57,7 @@ from site_audit.report import save_all
 from site_audit.utils import (
     AsyncResponse,
     async_fetch_many,
+    compute_optimal_semaphore,
     create_aiohttp_session,
     get_domain,
     is_async_response_ok,
@@ -57,7 +67,7 @@ logger = get_logger("service.audit")
 
 # ── Проверки, которые выполняют свои HTTP-запросы (IO-bound, async) ────────
 # Эти проверки имеют async_check() и должны вызываться напрямую через await
-# в текущем event loop, чтобы семафоры прокси работали корректно.
+# в текущем event loop, чтобы семафоры работали корректно.
 _ASYNC_IO_CHECKS: frozenset[str] = frozenset({
     "broken_links",
     "images",
@@ -124,14 +134,14 @@ class AuditParams:
     max_crawl_pages: int = 500
     max_depth: int = 3
     limit: int = 0
-    workers: int = 10
+    workers: int = 20
+
     delay: float = 0.0
 
-    # Жёсткий предохранитель от переполнения памяти: применяется
-    # к итоговому списку URL независимо от источника (sitemap или BFS),
-    # в отличие от limit (по умолчанию выключен) и max_crawl_pages
-    # (действует только на BFS-обход).
-    max_total_pages: int = 2000
+    # Опциональный предохранитель от переполнения памяти.
+    # 0 — без лимита (по умолчанию). Установите значение > 0
+    # через DEFAULT_MAX_TOTAL_PAGES в .env, если сервер ограничен по памяти.
+    max_total_pages: int = 0
 
     # Сетевые настройки (увеличены для устойчивости к медленным серверам)
     timeout: int = 30
@@ -162,20 +172,23 @@ class AuditResult:
 class AuditService:
     """
     Сервис выполнения полного цикла аудита сайта.
+
     Принимает настройки через конструктор (Dependency Injection),
     не зависит от конкретной точки входа (CLI/бот).
+
     При инициализации создаёт ProxyRotator из настроек —
     один ротатор переиспользуется для всех запросов аудита,
     включая проверки битых ссылок, картинок и robots.txt.
 
-    Перед началом аудита выполняет preflight-проверку прокси:
-    один GET-запрос к целевому сайту через каждый прокси.
-    Нерабочие прокси сразу исключаются из пула. Если ни один
-    прокси не работает — аудит продолжается без прокси.
+    Параллельность определяется ЕДИНЫМ семафором:
+      - С прокси: proxy_count * max_connections_per_proxy
+      - Без прокси: params.workers
+    Вычисляется через compute_optimal_semaphore() из utils.py.
+    Семафоры прокси (per-proxy) не используются, что исключает
+    двойную блокировку и зависания.
 
     IO-bound проверки (broken_links, images, robots_sitemap) выполняются
-    напрямую через await в текущем event loop, чтобы семафоры прокси
-    работали корректно (без конфликтов между разными loop'ами).
+    напрямую через await в текущем event loop.
 
     CPU-bound проверки (seo, empty_pages, duplicates, placeholders,
     mixed_content, meta_quality, heading_structure, orphan_pages)
@@ -186,12 +199,10 @@ class AuditService:
     """
 
     # Размер одной порции при загрузке страниц (этап 2). Ограничивает
-    # количество одновременно находящихся "в полёте" задач и сетевых
-    # буферов aiohttp. НЕ влияет на итоговый объём собранных HTML —
-    # это уже ограничено AuditParams.max_total_pages. Задача батчинга —
+    # количество одновременно находящихся "в полёте" задач. Задача батчинга —
     # сгладить пиковую нагрузку и дать сборщику мусора Python шанс
     # освободить промежуточные объекты между порциями.
-    _DOWNLOAD_BATCH_SIZE: int = 300
+    _DOWNLOAD_BATCH_SIZE: int = 500
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -254,6 +265,28 @@ class AuditService:
             output_dir=s.output_dir,
             excel_name=s.excel_report_name,
             html_name=s.html_report_name,
+        )
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Вычисление семафора
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _compute_semaphore_value(self, params: AuditParams) -> int:
+        """
+        Вычисляет значение общего семафора для HTTP-запросов.
+
+        С прокси: proxy_count * max_connections_per_proxy.
+        Без прокси: params.workers.
+
+        Args:
+            params: параметры аудита.
+
+        Returns:
+            Значение для asyncio.Semaphore.
+        """
+        return compute_optimal_semaphore(
+            proxy_rotator=self._proxy_rotator,
+            fallback_max_concurrent=params.workers,
         )
 
     # ═════════════════════════════════════════════════════════════════════
@@ -364,8 +397,15 @@ class AuditService:
         )
 
         # ── 2. Загрузка страниц ──────────────────────────────────
-        self._notify(on_progress, f"⬇️ Этап 2/4: Загрузка {len(urls)} страниц...")
-        pages = await self._download_pages_async(urls, params, on_progress)
+        semaphore_value = self._compute_semaphore_value(params)
+        self._notify(
+            on_progress,
+            f"⬇️ Этап 2/4: Загрузка {len(urls)} страниц "
+            f"(параллельность: {semaphore_value})...",
+        )
+        pages = await self._download_pages_async(
+            urls, params, semaphore_value, on_progress,
+        )
         ok_count = sum(1 for p in pages if p["html"] is not None)
         self._notify(on_progress, f"⬇️ Загружено с HTML: {ok_count}/{len(urls)}")
         logger.info(
@@ -379,7 +419,7 @@ class AuditService:
             f"🔎 Этап 3/4: Проверки ({len(params.check_names)} шт.)...",
         )
         results, summaries = await self._run_checks_async(
-            base_url, urls, pages, params, on_progress,
+            base_url, urls, pages, params, semaphore_value, on_progress,
         )
         total_issues = sum(len(rows) for rows in results.values())
         self._notify(on_progress, f"🔎 Проверки завершены. Проблем: {total_issues}")
@@ -514,9 +554,8 @@ class AuditService:
 
         Применяет два независимых ограничения к итоговому списку:
           1. params.limit — если задан явно (> 0), обрезает список.
-          2. params.max_total_pages — жёсткий предохранитель, применяется
-             ВСЕГДА, независимо от источника URL и от того, задан ли limit.
-             Защищает от переполнения памяти на сайтах с огромным sitemap.
+          2. params.max_total_pages — если задан явно (> 0), обрезает список.
+             Значение 0 означает «без лимита» — предохранитель отключён.
 
         Args:
             base_url: корневой URL сайта.
@@ -557,17 +596,16 @@ class AuditService:
                 verbose=False,
             )
 
+        # Пользовательский лимит (--limit N)
         if params.limit > 0:
             urls = urls[: params.limit]
 
-        # Глобальный предохранитель от переполнения памяти: обрезаем
-        # список ДО загрузки страниц, если он всё ещё больше допустимого.
-        # Срабатывает независимо от того, был ли задан --limit, и
-        # независимо от источника (sitemap или BFS).
-        if len(urls) > params.max_total_pages:
+        # Опциональный предохранитель от переполнения памяти.
+        # Срабатывает ТОЛЬКО если max_total_pages > 0 (явно задан).
+        # Значение 0 означает «без лимита» — предохранитель отключён.
+        if params.max_total_pages > 0 and len(urls) > params.max_total_pages:
             logger.warning(
-                "Превышен глобальный лимит страниц (max_total_pages), "
-                "список URL обрезан для защиты от переполнения памяти",
+                "Превышен лимит max_total_pages, список URL обрезан",
                 extra={"context": {
                     "found": len(urls),
                     "max_total_pages": params.max_total_pages,
@@ -585,38 +623,39 @@ class AuditService:
         self,
         urls: list[str],
         params: AuditParams,
+        semaphore_value: int,
         on_progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Асинхронно загружает HTML всех URL через aiohttp.
-        Использует семафор для ограничения количества одновременных запросов.
-        Переиспользует одну TCP-сессию для всех запросов.
-        Передаёт ProxyRotator для выполнения запросов через прокси.
 
-        Загружает URL порциями по _DOWNLOAD_BATCH_SIZE штук вместо одного
-        gather на весь список: это ограничивает пиковое количество
-        одновременно "в полёте" задач и сетевых буферов aiohttp, а также
-        даёт сборщику мусора Python возможность освободить промежуточные
-        объекты предыдущей порции, пока грузится следующая.
+        Уровень параллельности определяется единым семафором,
+        значение которого вычислено в _compute_semaphore_value:
+          - С прокси: proxy_count * max_connections_per_proxy
+          - Без прокси: params.workers
 
-        Передаёт keep_raw_content=False в async_fetch_many, так как здесь
-        используется только resp.text (см. ниже) — байты тела ответа не
-        нужны и не сохраняются, что вдвое сокращает память на страницу.
+        Загружает URL порциями по _DOWNLOAD_BATCH_SIZE штук:
+        это ограничивает пиковое количество задач "в полёте"
+        и даёт сборщику мусора освободить объекты между порциями.
 
         Args:
             urls: список URL для загрузки.
-            params: параметры аудита (workers, timeout, retries, delay).
+            params: параметры аудита (timeout, retries, delay).
+            semaphore_value: значение общего семафора параллельности.
             on_progress: callback для прогресса.
 
         Returns:
             Список словарей {"url", "resp", "html"} для каждого URL.
         """
-        max_concurrent = min(params.workers * 5, 100)
-        semaphore = asyncio.Semaphore(max_concurrent)
+        semaphore = asyncio.Semaphore(semaphore_value)
+
+        # Лимит коннектора = семафор + запас на DNS/handshake
+        connector_limit = semaphore_value + 20
         session = create_aiohttp_session(
-            max_concurrent=max_concurrent,
+            max_concurrent=connector_limit,
             timeout_total=params.timeout + 30,
             timeout_connect=min(10, params.timeout),
+            limit_per_host=0,
         )
 
         pages: list[dict[str, Any]] = []
@@ -673,6 +712,7 @@ class AuditService:
         urls: list[str],
         pages: list[dict[str, Any]],
         params: AuditParams,
+        semaphore_value: int,
         on_progress: Callable[[str], None] | None = None,
     ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
         """
@@ -680,8 +720,8 @@ class AuditService:
 
         Два режима выполнения:
           - IO-bound проверки (broken_links, images, robots_sitemap) —
-            вызываются напрямую через await в текущем event loop,
-            чтобы семафоры прокси из ProxyRotator работали корректно.
+            вызываются напрямую через await в текущем event loop.
+            Используют тот же семафор, что и загрузка страниц.
           - CPU-bound проверки (остальные) — запускаются в
             ThreadPoolExecutor через run_in_executor.
 
@@ -690,6 +730,7 @@ class AuditService:
             urls: список проверяемых URL.
             pages: загруженные страницы.
             params: параметры аудита.
+            semaphore_value: значение общего семафора для IO-проверок.
             on_progress: callback для прогресса.
 
         Returns:
@@ -698,7 +739,6 @@ class AuditService:
         results: dict[str, list[dict[str, Any]]] = {}
         summaries: dict[str, str] = {}
         domain = get_domain(base_url)
-        check_workers = min(params.workers, 5)
 
         loop = asyncio.get_running_loop()
         compatible_pages = _make_compatible_pages(pages)
@@ -725,11 +765,10 @@ class AuditService:
             t0 = time.time()
             try:
                 if name in _ASYNC_IO_CHECKS:
-                    # IO-bound: вызываем async_check напрямую в текущем loop,
-                    # чтобы семафоры прокси работали в одном event loop
+                    # IO-bound: вызываем async_check напрямую в текущем loop
                     res = await self._execute_async_check(
                         name, mod, compatible_pages, params,
-                        check_workers, base_url,
+                        semaphore_value, base_url,
                     )
                 else:
                     # CPU-bound: выносим в executor, чтобы не блокировать loop
@@ -770,26 +809,27 @@ class AuditService:
         mod: Any,
         pages: list[dict[str, Any]],
         params: AuditParams,
-        check_workers: int,
+        semaphore_value: int,
         base_url: str,
     ) -> list[dict[str, Any]]:
         """
         Выполняет IO-bound проверку напрямую через await в текущем event loop.
-        Это гарантирует, что семафоры прокси из ProxyRotator работают
-        в том же event loop, где были созданы — без конфликтов.
+
+        Используется тот же уровень параллельности (semaphore_value),
+        что и при загрузке страниц — он вычислен на основе пула прокси.
 
         Args:
             name: имя проверки.
             mod: модуль проверки.
             pages: загруженные страницы в совместимом формате.
             params: параметры аудита.
-            check_workers: количество одновременных запросов.
+            semaphore_value: значение семафора для HTTP-запросов.
             base_url: корневой URL сайта.
 
         Returns:
             Список найденных проблем.
         """
-        max_concurrent = max(check_workers, 1)
+        max_concurrent = max(semaphore_value, 1)
 
         if name == "broken_links":
             return await mod.async_check(

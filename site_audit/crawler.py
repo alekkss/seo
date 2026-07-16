@@ -22,6 +22,7 @@ from .proxy import ProxyRotator
 from .utils import (
     AsyncResponse,
     async_fetch,
+    compute_optimal_semaphore,
     create_aiohttp_session,
     get_domain,
     is_async_response_ok,
@@ -132,9 +133,15 @@ async def async_try_sitemap(
     urls: set[str] = set()
     visited_sitemaps: set[str] = set()
 
+    # Параллельность для загрузки вложенных sitemap согласована с прокси
+    sitemap_concurrent = compute_optimal_semaphore(
+        proxy_rotator=proxy_rotator,
+        fallback_max_concurrent=10,
+    )
     session = create_aiohttp_session(
-        max_concurrent=10,
+        max_concurrent=sitemap_concurrent + 10,
         timeout_total=_timeout,
+        limit_per_host=0,
     )
     try:
         for candidate in candidates:
@@ -214,7 +221,7 @@ async def _parse_sitemap(
         return
 
     try:
-        root = ET.fromstring(resp.content)
+        root = ET.fromstring(resp.content or resp.text.encode("utf-8"))
     except ET.ParseError as exc:
         logger.warning(
             "Ошибка парсинга XML sitemap",
@@ -286,13 +293,16 @@ async def async_crawl(
     извлекает внутренние ссылки и добавляет их в очередь.
     Работает послойно: сначала все URL глубины 0,
     затем все URL глубины 1 и т.д.
-    Использует настройки из get_settings() для таймаутов и retries.
+
+    Уровень параллельности определяется пулом прокси:
+      - С прокси: proxy_count * max_connections_per_proxy
+      - Без прокси: max_concurrent (параметр вызывающего кода)
 
     Args:
         base_url: стартовый URL.
         max_pages: максимальное количество собранных URL.
         max_depth: максимальная глубина обхода.
-        max_concurrent: количество одновременных запросов.
+        max_concurrent: количество одновременных запросов без прокси.
         timeout: таймаут HTTP-запросов в секундах (None — из настроек).
         retries: количество повторов при ошибках (None — из настроек).
         delay: задержка между запросами (для защиты от бана).
@@ -312,12 +322,32 @@ async def async_crawl(
 
     # Очередь послойного обхода: список URL текущего уровня глубины
     current_layer: list[str] = [base_url]
-    semaphore = asyncio.Semaphore(max_concurrent)
 
-    session = create_aiohttp_session(
-        max_concurrent=max_concurrent,
-        timeout_total=_timeout,
+    # Семафор вычисляется по пулу прокси — все прокси работают
+    semaphore_value = compute_optimal_semaphore(
+        proxy_rotator=proxy_rotator,
+        fallback_max_concurrent=max_concurrent,
     )
+    semaphore = asyncio.Semaphore(semaphore_value)
+
+    # Коннектор согласован с семафором
+    connector_limit = semaphore_value + 20
+    session = create_aiohttp_session(
+        max_concurrent=connector_limit,
+        timeout_total=_timeout,
+        limit_per_host=0,
+    )
+
+    logger.info(
+        "BFS-обход запущен",
+        extra={"context": {
+            "base_url": base_url,
+            "max_pages": max_pages,
+            "max_depth": max_depth,
+            "semaphore": semaphore_value,
+        }},
+    )
+
     try:
         for depth in range(max_depth):
             if not current_layer or len(collected) >= max_pages:
@@ -410,21 +440,25 @@ async def _fetch_layer(
     не ломал загрузку всего слоя BFS. Исключения оборачиваются
     в AsyncResponse с описанием ошибки.
 
+    Задержка (delay) реализована через staggered start: каждая задача
+    стартует со смещением, а не блокирует семафор во время ожидания.
+
     Args:
         urls: список URL текущего слоя BFS.
         session: aiohttp-сессия.
         semaphore: ограничитель параллельности.
         timeout: таймаут запроса.
         retries: количество повторов.
-        delay: задержка между запросами.
+        delay: задержка между стартами запросов.
         proxy_rotator: ротатор прокси (None — запросы напрямую).
 
     Returns:
         Список AsyncResponse для каждого URL.
     """
-    async def _fetch_one(url: str) -> AsyncResponse:
-        if delay > 0:
-            await asyncio.sleep(delay)
+    async def _fetch_one(index: int, url: str) -> AsyncResponse:
+        # Staggered start: задержка ДО запроса, ВНЕ семафора
+        if delay > 0 and index > 0:
+            await asyncio.sleep(delay * index)
         try:
             return await async_fetch(
                 url,
@@ -451,7 +485,7 @@ async def _fetch_layer(
                 ok=False,
             )
 
-    tasks = [_fetch_one(url) for url in urls]
+    tasks = [_fetch_one(i, url) for i, url in enumerate(urls)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Оборачиваем любые исключения из gather в AsyncResponse

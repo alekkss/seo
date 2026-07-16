@@ -6,6 +6,15 @@
 Фабрика create_aiohttp_session() создаёт переиспользуемую сессию
 с ограничением параллельности через asyncio.Semaphore.
 ProxyRotator инжектится в функции запросов для прозрачной ротации прокси.
+
+Архитектура семафоров (ВАЖНО):
+    Используется ОДИН уровень семафоров — общий семафор, передаваемый
+    в async_fetch/async_fetch_many. Он ограничивает общее количество
+    одновременных HTTP-запросов. Вызывающий код (audit_service) вычисляет
+    значение семафора на основе количества прокси и max_connections:
+        semaphore = proxy_count * max_connections_per_proxy
+    Семафоры прокси (ProxyRotator.get_semaphore) НЕ используются в async_fetch,
+    чтобы избежать двойной блокировки и deadlock'ов.
 """
 from __future__ import annotations
 
@@ -63,7 +72,7 @@ _DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ: int = 60
 
 # ── Пул соединений ───────────────────────────────────────────────────────────
 
-_DEFAULT_CONNECTOR_LIMIT: int = 100
+_DEFAULT_CONNECTOR_LIMIT: int = 200
 
 # ── Retry-стратегия ──────────────────────────────────────────────────────────
 
@@ -148,12 +157,20 @@ def create_aiohttp_session(
     max_concurrent: int = _DEFAULT_CONNECTOR_LIMIT,
     timeout_total: int = _DEFAULT_AIOHTTP_TIMEOUT_TOTAL,
     timeout_connect: int = _DEFAULT_AIOHTTP_TIMEOUT_CONNECT,
+    limit_per_host: int = 0,
 ) -> aiohttp.ClientSession:
     """
     Создаёт aiohttp.ClientSession с настроенным пулом соединений.
-    Пул ограничивает количество одновременных TCP-соединений,
-    а семафор (передаётся отдельно в async_fetch) — количество
+
+    Пул (TCPConnector) ограничивает количество одновременных TCP-соединений.
+    Семафор (передаётся отдельно в async_fetch) — ограничивает количество
     одновременных запросов в рамках бизнес-логики.
+
+    limit_per_host=0 по умолчанию: при использовании прокси запросы идут
+    через разные прокси-хосты, и ограничение per-host не имеет смысла.
+    Реальное ограничение обеспечивается общим семафором, который вычисляется
+    как proxy_count * max_connections_per_proxy.
+
     trust_env=False — чтобы aiohttp не подхватывал системные прокси,
     прокси передаются явно через параметр proxy в каждом запросе.
 
@@ -161,13 +178,14 @@ def create_aiohttp_session(
         max_concurrent: максимум одновременных соединений в пуле.
         timeout_total: общий таймаут запроса в секундах.
         timeout_connect: таймаут установки соединения в секундах.
+        limit_per_host: максимум соединений на один хост (0 — без лимита).
 
     Returns:
         Настроенный объект aiohttp.ClientSession.
     """
     connector = aiohttp.TCPConnector(
         limit=max_concurrent,
-        limit_per_host=30,
+        limit_per_host=limit_per_host,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
         force_close=False,
@@ -184,6 +202,57 @@ def create_aiohttp_session(
         headers=HEADERS,
         trust_env=False,
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Вычисление оптимального семафора
+# ═════════════════════════════════════════════════════════════════════════════
+
+def compute_optimal_semaphore(
+    *,
+    proxy_rotator: ProxyRotator | None = None,
+    fallback_max_concurrent: int = 20,
+) -> int:
+    """
+    Вычисляет оптимальное значение семафора на основе пула прокси.
+
+    Формула: proxy_count * max_connections_per_proxy.
+    Если прокси нет или отключены — используется fallback_max_concurrent.
+    Результат ограничен сверху значением 200 (лимит коннектора).
+
+    Это ЕДИНСТВЕННОЕ место, где определяется уровень параллельности
+    для HTTP-запросов. Вызывается из audit_service при создании
+    семафора для загрузки страниц и для проверок.
+
+    Args:
+        proxy_rotator: ротатор прокси (None — запросы напрямую).
+        fallback_max_concurrent: параллельность без прокси.
+
+    Returns:
+        Значение для asyncio.Semaphore.
+    """
+    if proxy_rotator is not None and proxy_rotator.is_enabled:
+        # Используем все прокси на полную: count * max_connections
+        optimal = proxy_rotator.total * proxy_rotator.max_connections
+        # Минимум 10, чтобы не деградировать при малом пуле
+        optimal = max(optimal, 10)
+        # Максимум — лимит коннектора
+        optimal = min(optimal, _DEFAULT_CONNECTOR_LIMIT)
+        logger.info(
+            "Семафор вычислен по пулу прокси",
+            extra={"context": {
+                "proxy_count": proxy_rotator.total,
+                "max_connections_per_proxy": proxy_rotator.max_connections,
+                "semaphore_value": optimal,
+            }},
+        )
+        return optimal
+
+    logger.info(
+        "Семафор без прокси",
+        extra={"context": {"semaphore_value": fallback_max_concurrent}},
+    )
+    return fallback_max_concurrent
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -245,8 +314,14 @@ async def async_fetch(
     Асинхронный HTTP-запрос с повторами, ограничением параллельности
     и поддержкой прокси-ротации с мягкими/жёсткими ошибками.
 
+    Архитектура семафоров:
+        Используется ОДИН семафор (semaphore) — общий ограничитель
+        параллельности. Семафор захватывается ТОЛЬКО на время HTTP-запроса,
+        а НЕ на время retry-ожидания. Это критически важно: при 3 retry
+        с backoff один неудачный URL может блокировать слот на 30+ секунд,
+        если семафор не освобождать между попытками.
+
     При каждой попытке запрашивает прокси у ProxyRotator (если передан).
-    Перед запросом захватывает семафор прокси (ограничение соединений).
     При жёсткой ошибке (проблема прокси) — мгновенный cooldown.
     При мягкой ошибке (таймаут) — инкремент счётчика.
     При успехе — сброс счётчика.
@@ -265,9 +340,7 @@ async def async_fetch(
         keep_raw_content: сохранять ли сырые байты тела ответа в
             AsyncResponse.content. По умолчанию True (полная обратная
             совместимость). Установите False, если вызывающему коду
-            нужен только .text — это вдвое сокращает память на страницу
-            при массовой загрузке (используется в async_fetch_many для
-            загрузки HTML-страниц, где байты никогда не читаются).
+            нужен только .text — это вдвое сокращает память на страницу.
 
     Returns:
         AsyncResponse с данными ответа.
@@ -282,289 +355,356 @@ async def async_fetch(
             sock_read=min(_DEFAULT_AIOHTTP_TIMEOUT_SOCK_READ, timeout),
         )
 
-    async def _do_request() -> AsyncResponse:
-        last_error = ""
-        last_status = 0
+    last_error = ""
+    last_status = 0
 
-        for attempt in range(retries + 1):
-            # Получаем прокси для этой попытки (может быть None)
-            proxy_url: str | None = None
-            proxy_sem: asyncio.Semaphore | None = None
-            if proxy_rotator is not None and proxy_rotator.is_enabled:
-                proxy_url = proxy_rotator.get_next()
-                if proxy_url:
-                    proxy_sem = proxy_rotator.get_semaphore(proxy_url)
-                    logger.debug(
-                        "Запрос через прокси",
-                        extra={"context": {
-                            "url": url,
-                            "proxy": _safe_proxy_label(proxy_url),
-                            "attempt": attempt + 1,
-                        }},
-                    )
-
-            try:
-                # Захватываем семафор прокси, если есть
-                if proxy_sem is not None:
-                    await proxy_sem.acquire()
-
-                try:
-                    async with session.request(
-                        method,
-                        url,
-                        timeout=request_timeout,
-                        allow_redirects=allow_redirects,
-                        proxy=proxy_url,
-                    ) as resp:
-                        last_status = resp.status
-
-                        # Определяем финальный URL после редиректов
-                        final = str(resp.url)
-
-                        # Собираем заголовки в обычный словарь
-                        resp_headers: dict[str, str] = {
-                            k: v for k, v in resp.headers.items()
-                        }
-
-                        # Читаем тело
-                        body_bytes = b""
-                        body_text = ""
-                        if read_body and method.upper() != "HEAD":
-                            body_bytes = await resp.read()
-                            encoding = resp.get_encoding() or "utf-8"
-                            try:
-                                body_text = body_bytes.decode(
-                                    encoding, errors="replace",
-                                )
-                            except (LookupError, UnicodeDecodeError):
-                                body_text = body_bytes.decode(
-                                    "utf-8", errors="replace",
-                                )
-
-                        is_ok = 200 <= resp.status < 400
-
-                        # Логируем неуспешные HTTP-статусы
-                        if not is_ok:
-                            logger.warning(
-                                "HTTP-ошибка",
-                                extra={"context": {
-                                    "url": url,
-                                    "status": resp.status,
-                                    "attempt": attempt + 1,
-                                    "proxy": _safe_proxy_label(proxy_url),
-                                }},
-                            )
-                            # Жёсткий отказ прокси (407)
-                            if (
-                                proxy_url
-                                and proxy_rotator is not None
-                                and resp.status in _PROXY_HARD_FAIL_STATUS_CODES
-                            ):
-                                proxy_rotator.mark_hard_fail(proxy_url)
-                            # Мягкий отказ (502/503 — может быть прокси, а может сайт)
-                            elif (
-                                proxy_url
-                                and proxy_rotator is not None
-                                and resp.status in _PROXY_SOFT_FAIL_STATUS_CODES
-                            ):
-                                proxy_rotator.mark_soft_fail(proxy_url)
-                        else:
-                            # Успешный ответ — сбрасываем счётчик ошибок
-                            if proxy_url and proxy_rotator is not None:
-                                proxy_rotator.mark_success(proxy_url)
-
-                        # keep_raw_content=False — не сохраняем сырые байты
-                        # в результате, чтобы не удваивать память на страницу
-                        # (текст уже декодирован в body_text выше).
-                        return AsyncResponse(
-                            url=url,
-                            status=resp.status,
-                            headers=resp_headers,
-                            text=body_text,
-                            content=body_bytes if keep_raw_content else b"",
-                            final_url=final,
-                            error="" if is_ok else f"HTTP {resp.status}",
-                            ok=is_ok,
-                        )
-
-                finally:
-                    # Освобождаем семафор прокси в любом случае
-                    if proxy_sem is not None:
-                        proxy_sem.release()
-
-            # ── Обработка ошибок сети ────────────────────────────────────
-            except asyncio.TimeoutError:
-                last_error = f"Таймаут запроса к {url}"
-                logger.warning(
-                    "Таймаут запроса",
+    for attempt in range(retries + 1):
+        # Получаем прокси для этой попытки (может быть None)
+        proxy_url: str | None = None
+        if proxy_rotator is not None and proxy_rotator.is_enabled:
+            proxy_url = proxy_rotator.get_next()
+            if proxy_url:
+                logger.debug(
+                    "Запрос через прокси",
                     extra={"context": {
                         "url": url,
+                        "proxy": _safe_proxy_label(proxy_url),
                         "attempt": attempt + 1,
-                        "max_retries": retries,
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Таймаут — мягкая ошибка: скорее всего сайт тормозит,
-                # а не прокси мёртв. Прокси уйдёт в cooldown только
-                # после max_fails таймаутов подряд.
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_soft_fail(proxy_url)
-
-            except aiohttp.ServerDisconnectedError as exc:
-                last_error = f"Сервер разорвал соединение: {url} — {exc}"
-                logger.warning(
-                    "Сервер разорвал соединение",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Разрыв соединения — мягкая ошибка
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_soft_fail(proxy_url)
-
-            except aiohttp.ClientSSLError as exc:
-                last_error = f"Ошибка SSL при подключении к {url}: {exc}"
-                logger.error(
-                    "Ошибка SSL",
-                    extra={"context": {
-                        "url": url,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # SSL-ошибки обычно не временные — не повторяем
-                break
-
-            except aiohttp.ClientProxyConnectionError as exc:
-                last_error = f"Ошибка подключения через прокси к {url}: {exc}"
-                logger.warning(
-                    "Ошибка подключения через прокси",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Однозначно проблема прокси — жёсткий отказ
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_hard_fail(proxy_url)
-
-            except aiohttp.ClientHttpProxyError as exc:
-                last_error = f"HTTP-ошибка прокси при запросе к {url}: {exc}"
-                logger.warning(
-                    "HTTP-ошибка прокси",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Однозначно проблема прокси — жёсткий отказ
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_hard_fail(proxy_url)
-
-            except aiohttp.ClientConnectorError as exc:
-                last_error = f"Ошибка подключения к {url}: {exc}"
-                logger.warning(
-                    "Ошибка подключения",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Ошибка подключения — мягкая (может быть и сайт, и прокси)
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_soft_fail(proxy_url)
-
-            except aiohttp.ClientPayloadError as exc:
-                last_error = f"Ошибка чтения ответа от {url}: {exc}"
-                logger.warning(
-                    "Ошибка чтения ответа",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Ошибка чтения — мягкая
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_soft_fail(proxy_url)
-
-            except aiohttp.ClientError as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "Ошибка aiohttp",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
-                    }},
-                )
-                # Общая ошибка — мягкая
-                if proxy_url and proxy_rotator is not None:
-                    proxy_rotator.mark_soft_fail(proxy_url)
-
-            except OSError as exc:
-                last_error = f"Ошибка сети: {exc}"
-                logger.warning(
-                    "Ошибка сети (OSError)",
-                    extra={"context": {
-                        "url": url,
-                        "attempt": attempt + 1,
-                        "error": str(exc),
-                        "proxy": _safe_proxy_label(proxy_url),
                     }},
                 )
 
-            # ── Решение о повторе ────────────────────────────────────────
-            if attempt < retries:
-                should_retry = bool(last_error) or last_status in _RETRY_STATUS_CODES
-                if should_retry:
-                    wait_time = _compute_retry_delay(attempt, retry_delay)
-                    logger.debug(
-                        "Повторная попытка",
-                        extra={"context": {
-                            "url": url,
-                            "next_attempt": attempt + 2,
-                            "wait_seconds": round(wait_time, 2),
-                        }},
-                    )
-                    await asyncio.sleep(wait_time)
-                else:
-                    break
+        try:
+            # Семафор захватывается ТОЛЬКО на время HTTP-запроса,
+            # а НЕ на время retry-ожидания между попытками
+            result = await _do_single_request(
+                url=url,
+                session=session,
+                semaphore=semaphore,
+                proxy_url=proxy_url,
+                proxy_rotator=proxy_rotator,
+                method=method,
+                request_timeout=request_timeout,
+                allow_redirects=allow_redirects,
+                read_body=read_body,
+                keep_raw_content=keep_raw_content,
+                attempt=attempt,
+            )
 
-        # Все попытки исчерпаны — логируем финальную ошибку
-        if last_error:
-            logger.error(
-                "Все попытки исчерпаны",
+            if result is not None:
+                # Запрос завершён (успешно или с HTTP-ошибкой, но без сетевой)
+                return result
+
+        except _RetryableError as err:
+            # Сетевая ошибка, которую можно повторить
+            last_error = err.message
+            last_status = 0
+
+        except _NonRetryableError as err:
+            # Ошибка, которую нет смысла повторять (SSL и т.п.)
+            last_error = err.message
+            last_status = 0
+            break
+
+        # ── Ожидание перед повтором (ВНЕ семафора) ──────────────────
+        if attempt < retries:
+            wait_time = _compute_retry_delay(attempt, retry_delay)
+            logger.debug(
+                "Повторная попытка",
                 extra={"context": {
                     "url": url,
-                    "attempts": retries + 1,
-                    "last_error": last_error,
+                    "next_attempt": attempt + 2,
+                    "wait_seconds": round(wait_time, 2),
                 }},
             )
+            await asyncio.sleep(wait_time)
+
+    # Все попытки исчерпаны
+    if last_error:
+        logger.error(
+            "Все попытки исчерпаны",
+            extra={"context": {
+                "url": url,
+                "attempts": retries + 1,
+                "last_error": last_error,
+            }},
+        )
+
+    return AsyncResponse(
+        url=url,
+        status=last_status,
+        error=last_error,
+        ok=False,
+    )
+
+
+class _RetryableError(Exception):
+    """Сетевая ошибка, при которой имеет смысл повторить запрос."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class _NonRetryableError(Exception):
+    """Ошибка, при которой повтор не поможет (SSL, и т.п.)."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+async def _do_single_request(
+    *,
+    url: str,
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore | None,
+    proxy_url: str | None,
+    proxy_rotator: ProxyRotator | None,
+    method: str,
+    request_timeout: aiohttp.ClientTimeout | None,
+    allow_redirects: bool,
+    read_body: bool,
+    keep_raw_content: bool,
+    attempt: int,
+) -> AsyncResponse | None:
+    """
+    Выполняет один HTTP-запрос внутри семафора.
+
+    Возвращает AsyncResponse, если запрос завершился (успешно или с HTTP-ошибкой).
+    Возвращает None — не используется, вместо этого бросает исключения:
+      - _RetryableError — для ошибок, которые можно повторить.
+      - _NonRetryableError — для ошибок, которые нет смысла повторять.
+
+    Семафор захватывается только на время реального HTTP-запроса.
+
+    Args:
+        url: адрес запроса.
+        session: aiohttp-сессия.
+        semaphore: общий семафор параллельности.
+        proxy_url: URL прокси для этого запроса (или None).
+        proxy_rotator: ротатор для mark_success/mark_fail.
+        method: HTTP-метод.
+        request_timeout: таймаут запроса.
+        allow_redirects: следовать за редиректами.
+        read_body: читать тело ответа.
+        keep_raw_content: сохранять сырые байты.
+        attempt: номер попытки (для логов).
+
+    Returns:
+        AsyncResponse при завершении запроса.
+
+    Raises:
+        _RetryableError: при сетевых ошибках, которые можно повторить.
+        _NonRetryableError: при ошибках, которые нет смысла повторять.
+    """
+    try:
+        # ── Захват семафора → HTTP-запрос → освобождение ──────────
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            async with session.request(
+                method,
+                url,
+                timeout=request_timeout,
+                allow_redirects=allow_redirects,
+                proxy=proxy_url,
+            ) as resp:
+                last_status = resp.status
+                final = str(resp.url)
+                resp_headers: dict[str, str] = {
+                    k: v for k, v in resp.headers.items()
+                }
+
+                body_bytes = b""
+                body_text = ""
+                if read_body and method.upper() != "HEAD":
+                    body_bytes = await resp.read()
+                    encoding = resp.get_encoding() or "utf-8"
+                    try:
+                        body_text = body_bytes.decode(
+                            encoding, errors="replace",
+                        )
+                    except (LookupError, UnicodeDecodeError):
+                        body_text = body_bytes.decode(
+                            "utf-8", errors="replace",
+                        )
+
+                is_ok = 200 <= resp.status < 400
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
+        # ── Обработка результата (уже ВНЕ семафора) ──────────────
+        if not is_ok:
+            logger.warning(
+                "HTTP-ошибка",
+                extra={"context": {
+                    "url": url,
+                    "status": last_status,
+                    "attempt": attempt + 1,
+                    "proxy": _safe_proxy_label(proxy_url),
+                }},
+            )
+            if (
+                proxy_url
+                and proxy_rotator is not None
+                and last_status in _PROXY_HARD_FAIL_STATUS_CODES
+            ):
+                proxy_rotator.mark_hard_fail(proxy_url)
+            elif (
+                proxy_url
+                and proxy_rotator is not None
+                and last_status in _PROXY_SOFT_FAIL_STATUS_CODES
+            ):
+                proxy_rotator.mark_soft_fail(proxy_url)
+
+            # Retryable HTTP-статусы — бросаем исключение для повтора
+            if last_status in _RETRY_STATUS_CODES:
+                raise _RetryableError(f"HTTP {last_status}")
+        else:
+            if proxy_url and proxy_rotator is not None:
+                proxy_rotator.mark_success(proxy_url)
 
         return AsyncResponse(
             url=url,
             status=last_status,
-            error=last_error,
-            ok=False,
+            headers=resp_headers,
+            text=body_text,
+            content=body_bytes if keep_raw_content else b"",
+            final_url=final,
+            error="" if is_ok else f"HTTP {last_status}",
+            ok=is_ok,
         )
 
-    if semaphore is not None:
-        async with semaphore:
-            return await _do_request()
-    return await _do_request()
+    # ── Обработка сетевых ошибок ─────────────────────────────────────
+    except _RetryableError:
+        # Пробрасываем дальше — retry обрабатывается в async_fetch
+        raise
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Таймаут запроса",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_soft_fail(proxy_url)
+        raise _RetryableError(f"Таймаут запроса к {url}")
+
+    except aiohttp.ServerDisconnectedError as exc:
+        logger.warning(
+            "Сервер разорвал соединение",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_soft_fail(proxy_url)
+        raise _RetryableError(f"Сервер разорвал соединение: {url} — {exc}")
+
+    except aiohttp.ClientSSLError as exc:
+        logger.error(
+            "Ошибка SSL",
+            extra={"context": {
+                "url": url,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        raise _NonRetryableError(f"Ошибка SSL при подключении к {url}: {exc}")
+
+    except aiohttp.ClientProxyConnectionError as exc:
+        logger.warning(
+            "Ошибка подключения через прокси",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_hard_fail(proxy_url)
+        raise _RetryableError(
+            f"Ошибка подключения через прокси к {url}: {exc}",
+        )
+
+    except aiohttp.ClientHttpProxyError as exc:
+        logger.warning(
+            "HTTP-ошибка прокси",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_hard_fail(proxy_url)
+        raise _RetryableError(
+            f"HTTP-ошибка прокси при запросе к {url}: {exc}",
+        )
+
+    except aiohttp.ClientConnectorError as exc:
+        logger.warning(
+            "Ошибка подключения",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_soft_fail(proxy_url)
+        raise _RetryableError(f"Ошибка подключения к {url}: {exc}")
+
+    except aiohttp.ClientPayloadError as exc:
+        logger.warning(
+            "Ошибка чтения ответа",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_soft_fail(proxy_url)
+        raise _RetryableError(f"Ошибка чтения ответа от {url}: {exc}")
+
+    except aiohttp.ClientError as exc:
+        logger.warning(
+            "Ошибка aiohttp",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        if proxy_url and proxy_rotator is not None:
+            proxy_rotator.mark_soft_fail(proxy_url)
+        raise _RetryableError(f"{type(exc).__name__}: {exc}")
+
+    except OSError as exc:
+        logger.warning(
+            "Ошибка сети (OSError)",
+            extra={"context": {
+                "url": url,
+                "attempt": attempt + 1,
+                "error": str(exc),
+                "proxy": _safe_proxy_label(proxy_url),
+            }},
+        )
+        raise _RetryableError(f"Ошибка сети: {exc}")
 
 
 async def async_head(
@@ -643,9 +783,11 @@ async def async_fetch_many(
     """
     Массовая загрузка URL с ограничением параллельности, прогрессом
     и поддержкой прокси-ротации.
-    Это основная рабочая лошадка для этапа загрузки страниц.
-    Все запросы выполняются конкурентно через asyncio.gather,
-    а семафор ограничивает количество одновременных соединений.
+
+    Задержка (delay) реализована через staggered start: каждая задача
+    стартует со смещением delay * index секунд. Это НЕ блокирует семафор
+    во время ожидания — задача ждёт ДО захвата семафора, а не после.
+
     CRITICAL: return_exceptions=True — чтобы один таймаут не ломал весь батч.
 
     Args:
@@ -655,14 +797,10 @@ async def async_fetch_many(
         proxy_rotator: ротатор прокси (None — запросы напрямую).
         timeout: таймаут каждого запроса в секундах.
         retries: количество повторов при ошибке.
-        delay: задержка между запросами в секундах (для защиты от бана).
+        delay: задержка между стартами запросов (секунды).
         on_progress: callback(message: str) для отправки прогресса.
         progress_every: как часто вызывать on_progress (каждые N запросов).
         keep_raw_content: передаётся в async_fetch для каждого URL.
-            По умолчанию True (обратная совместимость). Вызывающий код,
-            которому нужен только .text (например, загрузка HTML-страниц
-            для проверок), должен передать False — это вдвое сократит
-            память на страницу при массовой загрузке.
 
     Returns:
         Список AsyncResponse в том же порядке, что и urls.
@@ -671,10 +809,15 @@ async def async_fetch_many(
     done_count = 0
     lock = asyncio.Lock()
 
-    async def _fetch_one(url: str) -> AsyncResponse:
+    async def _fetch_one(index: int, url: str) -> AsyncResponse:
         nonlocal done_count
-        if delay > 0:
-            await asyncio.sleep(delay)
+
+        # Staggered start: задержка ДО запроса, но ВНЕ семафора.
+        # Запросы стартуют волнами, а не все сразу — это защищает
+        # от бана при массовой загрузке, не блокируя семафор.
+        if delay > 0 and index > 0:
+            await asyncio.sleep(delay * index)
+
         try:
             resp = await async_fetch(
                 url,
@@ -686,7 +829,6 @@ async def async_fetch_many(
                 keep_raw_content=keep_raw_content,
             )
         except Exception as exc:
-            # Защита от неожиданных исключений
             logger.error(
                 "Неожиданная ошибка в async_fetch_many",
                 extra={"context": {
@@ -708,7 +850,7 @@ async def async_fetch_many(
 
         return resp
 
-    tasks = [_fetch_one(url) for url in urls]
+    tasks = [_fetch_one(i, url) for i, url in enumerate(urls)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Оборачиваем любые исключения из gather в AsyncResponse
@@ -798,12 +940,10 @@ def fetch(
             last = resp
 
             if resp.status_code < 500:
-                # Успешный ответ — сбрасываем счётчик ошибок
                 if proxy_url and proxy_rotator is not None:
                     proxy_rotator.mark_success(proxy_url)
                 return resp
 
-            # 5xx — логируем и повторяем
             logger.warning(
                 "HTTP-ошибка (sync)",
                 extra={"context": {
@@ -814,14 +954,12 @@ def fetch(
                 }},
             )
 
-            # Жёсткий отказ (407)
             if (
                 proxy_url
                 and proxy_rotator is not None
                 and resp.status_code in _PROXY_HARD_FAIL_STATUS_CODES
             ):
                 proxy_rotator.mark_hard_fail(proxy_url)
-            # Мягкий отказ (502/503)
             elif (
                 proxy_url
                 and proxy_rotator is not None
@@ -839,7 +977,6 @@ def fetch(
                     "proxy": _safe_proxy_label(proxy_url),
                 }},
             )
-            # SSL-ошибки обычно не временные — не повторяем
             break
 
         except requests.exceptions.ProxyError as exc:
@@ -853,7 +990,6 @@ def fetch(
                     "proxy": _safe_proxy_label(proxy_url),
                 }},
             )
-            # Однозначно проблема прокси — жёсткий отказ
             if proxy_url and proxy_rotator is not None:
                 proxy_rotator.mark_hard_fail(proxy_url)
 
@@ -868,7 +1004,6 @@ def fetch(
                     "proxy": _safe_proxy_label(proxy_url),
                 }},
             )
-            # Таймаут — мягкая ошибка
             if proxy_url and proxy_rotator is not None:
                 proxy_rotator.mark_soft_fail(proxy_url)
 
@@ -883,7 +1018,6 @@ def fetch(
                     "proxy": _safe_proxy_label(proxy_url),
                 }},
             )
-            # Ошибка подключения — мягкая
             if proxy_url and proxy_rotator is not None:
                 proxy_rotator.mark_soft_fail(proxy_url)
 
@@ -900,12 +1034,10 @@ def fetch(
                 }},
             )
 
-        # Задержка перед повтором
         if attempt < retries:
             wait_time = retry_delay * (attempt + 1)
             time.sleep(wait_time)
 
-    # Все попытки исчерпаны
     if last is not None and isinstance(last, Exception):
         logger.error(
             "Все попытки исчерпаны (sync)",

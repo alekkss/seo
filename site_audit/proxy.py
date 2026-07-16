@@ -1,7 +1,13 @@
 """
 Управление пулом прокси-серверов: загрузка из файла, round-robin ротация,
-мягкий и жёсткий отказ, автоматическое восстановление через cooldown,
-ограничение одновременных соединений на каждый прокси.
+мягкий и жёсткий отказ, автоматическое восстановление через cooldown.
+
+Архитектура параллельности (ВАЖНО):
+    Ограничение одновременных соединений на прокси обеспечивается ЕДИНЫМ
+    общим семафором в вызывающем коде (audit_service / utils), а НЕ
+    отдельными семафорами на каждый прокси. Значение общего семафора
+    вычисляется как proxy_count * max_connections (см. compute_optimal_semaphore
+    в utils.py). Это исключает двойную блокировку и deadlock'и.
 
 Два типа ошибок:
   - mark_hard_fail() — проблема прокси (407, ClientProxyConnectionError):
@@ -17,7 +23,6 @@ Preflight-проверка:
 Использование:
     rotator = ProxyRotator.from_file("proxies.txt", cooldown=120, max_fails=3)
     proxy_url = rotator.get_next()       # "http://login:password@host:port" или None
-    sem = rotator.get_semaphore(proxy_url)  # семафор для этого прокси
     rotator.mark_soft_fail(proxy_url)    # мягкая ошибка (таймаут)
     rotator.mark_hard_fail(proxy_url)    # жёсткая ошибка (прокси мёртв)
     rotator.mark_success(proxy_url)      # успех — сброс счётчика
@@ -101,7 +106,7 @@ class PreflightResult:
 
 class ProxyRotator:
     """
-    Round-robin ротатор прокси с мягким/жёстким отказом и семафорами.
+    Round-robin ротатор прокси с мягким/жёстким отказом.
 
     Принцип работы:
     - Прокси выдаются по кругу (round-robin) через потокобезопасный индекс.
@@ -111,13 +116,21 @@ class ProxyRotator:
     - mark_success() сбрасывает счётчик ошибок.
     - По истечении cooldown прокси автоматически возвращается в пул
       с обнулённым счётчиком.
-    - Каждый прокси имеет свой asyncio.Semaphore для ограничения
-      одновременных соединений.
     - Если все прокси в cooldown — возвращает None (запрос пойдёт напрямую).
     - preflight_check() позволяет заранее отсеять нерабочие прокси.
 
+    Ограничение параллельности:
+    - Общее количество одновременных соединений ограничивается ЕДИНЫМ
+      семафором в вызывающем коде, а НЕ отдельными семафорами на каждый
+      прокси. Значение семафора = proxy_count * max_connections.
+    - Свойство max_connections предоставляет значение для вычисления
+      семафора (см. compute_optimal_semaphore в utils.py).
+
     Потокобезопасность обеспечена через threading.Lock, что корректно
     работает и в asyncio (Lock захватывается на микросекунды без I/O).
+
+    Быстрый поиск прокси по URL обеспечивается словарём _by_url для O(1)
+    доступа в mark_success/mark_soft_fail/mark_hard_fail.
     """
 
     def __init__(
@@ -126,7 +139,7 @@ class ProxyRotator:
         *,
         cooldown: float = 120.0,
         max_fails: int = 3,
-        max_connections: int = 5,
+        max_connections: int = 3,
     ) -> None:
         """
         Инициализирует ротатор с готовым списком прокси.
@@ -137,6 +150,8 @@ class ProxyRotator:
                       исключается из ротации.
             max_fails: количество последовательных мягких ошибок до cooldown.
             max_connections: максимум одновременных соединений на один прокси.
+                Используется для вычисления общего семафора в вызывающем
+                коде: semaphore = proxy_count * max_connections.
         """
         self._proxies: list[ProxyEntry] = proxies
         self._cooldown: float = cooldown
@@ -145,10 +160,9 @@ class ProxyRotator:
         self._index: int = 0
         self._lock: threading.Lock = threading.Lock()
 
-        # Семафор для каждого прокси — ограничивает одновременные соединения
-        self._semaphores: dict[str, asyncio.Semaphore] = {
-            proxy.url: asyncio.Semaphore(max_connections)
-            for proxy in proxies
+        # O(1) поиск прокси по URL — вместо линейного перебора в mark_*
+        self._by_url: dict[str, ProxyEntry] = {
+            proxy.url: proxy for proxy in proxies
         }
 
         if self._proxies:
@@ -173,7 +187,7 @@ class ProxyRotator:
         *,
         cooldown: float = 120.0,
         max_fails: int = 3,
-        max_connections: int = 5,
+        max_connections: int = 3,
     ) -> ProxyRotator:
         """
         Фабричный метод: создаёт ротатор, загружая прокси из текстового файла.
@@ -291,6 +305,11 @@ class ProxyRotator:
         return len(self._proxies)
 
     @property
+    def max_connections(self) -> int:
+        """Максимум одновременных соединений на один прокси."""
+        return self._max_connections
+
+    @property
     def healthy_count(self) -> int:
         """Количество прокси, доступных для запросов (не в cooldown)."""
         now = time.monotonic()
@@ -347,21 +366,17 @@ class ProxyRotator:
         )
         return None
 
-    def get_semaphore(self, proxy_url: str | None) -> asyncio.Semaphore | None:
+    def _find_proxy(self, proxy_url: str) -> ProxyEntry | None:
         """
-        Возвращает семафор для указанного прокси.
-        Используется в async_fetch для ограничения одновременных
-        соединений через конкретный прокси-сервер.
+        Находит ProxyEntry по URL за O(1) через словарь.
 
         Args:
             proxy_url: URL прокси, полученный из get_next().
 
         Returns:
-            asyncio.Semaphore для этого прокси или None.
+            ProxyEntry или None, если прокси не найден.
         """
-        if not proxy_url:
-            return None
-        return self._semaphores.get(proxy_url)
+        return self._by_url.get(proxy_url)
 
     def mark_soft_fail(self, proxy_url: str) -> None:
         """
@@ -378,31 +393,32 @@ class ProxyRotator:
             return
 
         with self._lock:
-            for proxy in self._proxies:
-                if proxy.url == proxy_url:
-                    proxy.fail_count += 1
+            proxy = self._find_proxy(proxy_url)
+            if proxy is None:
+                return
 
-                    if proxy.fail_count >= self._max_fails:
-                        proxy.failed_at = time.monotonic()
-                        logger.warning(
-                            "Прокси отправлен в cooldown после серии ошибок",
-                            extra={"context": {
-                                "proxy": str(proxy),
-                                "fail_count": proxy.fail_count,
-                                "max_fails": self._max_fails,
-                                "cooldown_seconds": self._cooldown,
-                            }},
-                        )
-                    else:
-                        logger.debug(
-                            "Мягкая ошибка прокси (счётчик увеличен)",
-                            extra={"context": {
-                                "proxy": str(proxy),
-                                "fail_count": proxy.fail_count,
-                                "max_fails": self._max_fails,
-                            }},
-                        )
-                    return
+            proxy.fail_count += 1
+
+            if proxy.fail_count >= self._max_fails:
+                proxy.failed_at = time.monotonic()
+                logger.warning(
+                    "Прокси отправлен в cooldown после серии ошибок",
+                    extra={"context": {
+                        "proxy": str(proxy),
+                        "fail_count": proxy.fail_count,
+                        "max_fails": self._max_fails,
+                        "cooldown_seconds": self._cooldown,
+                    }},
+                )
+            else:
+                logger.debug(
+                    "Мягкая ошибка прокси (счётчик увеличен)",
+                    extra={"context": {
+                        "proxy": str(proxy),
+                        "fail_count": proxy.fail_count,
+                        "max_fails": self._max_fails,
+                    }},
+                )
 
     def mark_hard_fail(self, proxy_url: str) -> None:
         """
@@ -417,18 +433,19 @@ class ProxyRotator:
             return
 
         with self._lock:
-            for proxy in self._proxies:
-                if proxy.url == proxy_url:
-                    proxy.failed_at = time.monotonic()
-                    logger.warning(
-                        "Прокси отправлен в cooldown (жёсткая ошибка)",
-                        extra={"context": {
-                            "proxy": str(proxy),
-                            "fail_count": proxy.fail_count,
-                            "cooldown_seconds": self._cooldown,
-                        }},
-                    )
-                    return
+            proxy = self._find_proxy(proxy_url)
+            if proxy is None:
+                return
+
+            proxy.failed_at = time.monotonic()
+            logger.warning(
+                "Прокси отправлен в cooldown (жёсткая ошибка)",
+                extra={"context": {
+                    "proxy": str(proxy),
+                    "fail_count": proxy.fail_count,
+                    "cooldown_seconds": self._cooldown,
+                }},
+            )
 
     def mark_success(self, proxy_url: str) -> None:
         """
@@ -444,18 +461,19 @@ class ProxyRotator:
             return
 
         with self._lock:
-            for proxy in self._proxies:
-                if proxy.url == proxy_url:
-                    if proxy.fail_count > 0:
-                        logger.debug(
-                            "Счётчик ошибок прокси сброшен после успеха",
-                            extra={"context": {
-                                "proxy": str(proxy),
-                                "was_fail_count": proxy.fail_count,
-                            }},
-                        )
-                        proxy.fail_count = 0
-                    return
+            proxy = self._find_proxy(proxy_url)
+            if proxy is None:
+                return
+
+            if proxy.fail_count > 0:
+                logger.debug(
+                    "Счётчик ошибок прокси сброшен после успеха",
+                    extra={"context": {
+                        "proxy": str(proxy),
+                        "was_fail_count": proxy.fail_count,
+                    }},
+                )
+                proxy.fail_count = 0
 
     def get_status(self) -> list[dict[str, str | bool | int]]:
         """
@@ -574,9 +592,6 @@ class ProxyRotator:
                         allow_redirects=True,
                         ssl=False,
                     ) as response:
-                        # Любой ответ < 500 означает, что прокси доставил запрос
-                        # 403/404 — сайт ответил, прокси работает
-                        # 502/503/504 — возможно проблема прокси или сайта
                         if response.status < 500:
                             return {
                                 "proxy": proxy_label,

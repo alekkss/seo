@@ -29,22 +29,21 @@ class Settings:
     proxy_file_path: str = "./proxies.txt"
     proxy_cooldown: float = 120.0
     proxy_max_fails: int = 3
-    proxy_max_connections: int = 5
+    proxy_max_connections: int = 3
 
     # ── Параметры аудита ──────────────────────────────────────
     default_max_crawl_pages: int = 500
     default_max_depth: int = 3
     default_limit: int = 0
-    default_workers: int = 10
+    default_workers: int = 20
     default_delay: float = 0.0
 
-    # Жёсткий предохранитель от переполнения памяти: максимальное общее
-    # количество страниц для аудита, применяется НЕЗАВИСИМО от источника
-    # URL (sitemap или BFS-обход). В отличие от default_max_crawl_pages
-    # (который ограничивает только BFS-обход) и default_limit (который
-    # по умолчанию выключен — 0 означает "без лимита"), этот параметр
-    # всегда активен и защищает от случаев вроде sitemap с 20000+ URL.
-    default_max_total_pages: int = 2000
+    # Опциональный предохранитель от переполнения памяти: максимальное
+    # общее количество страниц для аудита. Применяется НЕЗАВИСИМО от
+    # источника URL (sitemap или BFS-обход).
+    # 0 — без лимита (по умолчанию). Установите значение > 0 через
+    # DEFAULT_MAX_TOTAL_PAGES в .env, если сервер ограничен по памяти.
+    default_max_total_pages: int = 0
 
     # Сетевые настройки (увеличены для устойчивости к медленным серверам)
     default_timeout: int = 30
@@ -92,7 +91,7 @@ def _parse_allowed_user_ids(raw: str) -> list[int]:
 
 
 def _validate_positive_int(value: int, name: str) -> None:
-    """Проверяет, что значение — положительное целое число."""
+    """Проверяет, что значение — неотрицательное целое число."""
     if value < 0:
         raise ValueError(
             f"Переменная {name} не может быть отрицательной: {value}"
@@ -140,18 +139,18 @@ def _load_settings() -> Settings:
     proxy_file_path = os.getenv("PROXY_FILE_PATH", "./proxies.txt").strip()
     proxy_cooldown = float(os.getenv("PROXY_COOLDOWN", "120"))
     proxy_max_fails = int(os.getenv("PROXY_MAX_FAILS", "3"))
-    proxy_max_connections = int(os.getenv("PROXY_MAX_CONNECTIONS", "5"))
+    proxy_max_connections = int(os.getenv("PROXY_MAX_CONNECTIONS", "3"))
 
     # ── Параметры аудита ──────────────────────────────────────
     default_max_crawl_pages = int(os.getenv("DEFAULT_MAX_CRAWL_PAGES", "500"))
     default_max_depth = int(os.getenv("DEFAULT_MAX_DEPTH", "3"))
     default_limit = int(os.getenv("DEFAULT_LIMIT", "0"))
-    default_workers = int(os.getenv("DEFAULT_WORKERS", "10"))
+    default_workers = int(os.getenv("DEFAULT_WORKERS", "20"))
     default_delay = float(os.getenv("DEFAULT_DELAY", "0.0"))
 
-    # Глобальный предохранитель по общему числу страниц
+    # Опциональный предохранитель: 0 = без лимита
     default_max_total_pages = int(
-        os.getenv("DEFAULT_MAX_TOTAL_PAGES", "2000")
+        os.getenv("DEFAULT_MAX_TOTAL_PAGES", "0")
     )
 
     # Сетевые настройки
@@ -206,11 +205,6 @@ def _load_settings() -> Settings:
     if default_retries < 0:
         raise ValueError(
             f"Переменная DEFAULT_RETRIES не может быть отрицательной: {default_retries}"
-        )
-    if default_max_total_pages < 1:
-        raise ValueError(
-            f"Переменная DEFAULT_MAX_TOTAL_PAGES должна быть >= 1: "
-            f"{default_max_total_pages}"
         )
 
     # Валидация прокси
